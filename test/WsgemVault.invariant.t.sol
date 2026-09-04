@@ -343,10 +343,9 @@ contract WsgemVaultInvariantTest is VaultTestBase {
 
 /// @notice Adds every governable and privileged lever (smelt, oracle pause, market pause,
 /// cooldown, capacity, liquidity drain) and scores every deposit/redeem op for QUOTE
-/// HONESTY, ERC-4626 style: a quote never reverts for operational reasons (the one
-/// exception is previewWithdraw while the exit unit is zero, and then execution must
-/// revert too), execution may revert on a gate while the quote stands, and whenever
-/// execution succeeds its result equals the quote. Violations are counted, never asserted
+/// HONESTY, ERC-4626 style: a quote never reverts, execution may revert on a gate while the
+/// quote stands, and whenever execution succeeds its result equals the quote. Violations
+/// are counted, never asserted
 /// inside the handler, so a sequence keeps running after a breach and the invariant sees it.
 contract VaultAdversarialHandler is Test {
     uint256 internal constant WAD = 1e18;
@@ -459,16 +458,10 @@ contract VaultAdversarialHandler is Test {
         return a < b ? a : b;
     }
 
-    /// @dev The quote-side exit unit: live burncost, or the cached one while paused.
-    function _burnUnitRef() internal view returns (uint256) {
-        return wsgem.navprice() == 0 ? vault.lastBurnUnit() : wsgem.burncost();
-    }
-
-    /// @dev Quote first, execute second (as `caller`), and score the pair for honesty. A
-    /// quote may revert only when `quoteMayRevert` (previewWithdraw with a zero exit unit)
-    /// and then execution must revert too; a standing quote must equal a successful
-    /// execution's result. Returns the amount on success.
-    function _quoted(bytes memory previewCall, bytes memory execCall, address caller, bool quoteMayRevert)
+    /// @dev Quote first, execute second (as `caller`), and score the pair for honesty: a
+    /// quote never reverts, and a standing quote must equal a successful execution's
+    /// result. Returns the amount on success.
+    function _quoted(bytes memory previewCall, bytes memory execCall, address caller)
         internal
         returns (bool ok, uint256 value)
     {
@@ -476,7 +469,7 @@ contract VaultAdversarialHandler is Test {
         vm.prank(caller);
         (bool eOk, bytes memory eRet) = address(vault).call(execCall);
         if (!pOk) {
-            if (!quoteMayRevert || eOk) quoteReverted++;
+            quoteReverted++;
             return (false, 0);
         }
         if (!eOk) return (false, 0);
@@ -530,9 +523,8 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         gem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) = _quoted(
-            abi.encodeCall(vault.previewDeposit, (assets)), abi.encodeCall(vault.deposit, (assets, u)), u, false
-        );
+        (bool ok,) =
+            _quoted(abi.encodeCall(vault.previewDeposit, (assets)), abi.encodeCall(vault.deposit, (assets, u)), u);
         _scoreDeposit(ok, inDeficit);
         depositGemOps++;
     }
@@ -545,8 +537,7 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         gem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) =
-            _quoted(abi.encodeCall(vault.previewMint, (shares)), abi.encodeCall(vault.mint, (shares, u)), u, false);
+        (bool ok,) = _quoted(abi.encodeCall(vault.previewMint, (shares)), abi.encodeCall(vault.mint, (shares, u)), u);
         _scoreDeposit(ok, inDeficit);
         mintSharesOps++;
     }
@@ -562,9 +553,8 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         wsgem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) = _quoted(
-            abi.encodeCall(vault.previewDepositWsgem, (amt)), abi.encodeCall(vault.depositWsgem, (amt, u)), u, false
-        );
+        (bool ok,) =
+            _quoted(abi.encodeCall(vault.previewDepositWsgem, (amt)), abi.encodeCall(vault.depositWsgem, (amt, u)), u);
         _scoreDeposit(ok, inDeficit);
         depositWsgemOps++;
     }
@@ -578,9 +568,8 @@ contract VaultAdversarialHandler is Test {
         }
         shares = bound(shares, 1, bal);
         uint256 held = wsgem.balanceOf(address(vault));
-        (bool ok,) = _quoted(
-            abi.encodeCall(vault.previewRedeem, (shares)), abi.encodeCall(vault.redeem, (shares, u, u)), u, false
-        );
+        (bool ok,) =
+            _quoted(abi.encodeCall(vault.previewRedeem, (shares)), abi.encodeCall(vault.redeem, (shares, u, u)), u);
         _scoreRedeem(ok, shares, held, true);
         redeemGemOps++;
     }
@@ -597,12 +586,8 @@ contract VaultAdversarialHandler is Test {
         uint256 cap = vault.previewRedeem(bal);
         assets = bound(assets, 1, cap == 0 ? 1 : cap);
         uint256 held = wsgem.balanceOf(address(vault));
-        (bool ok, uint256 burned) = _quoted(
-            abi.encodeCall(vault.previewWithdraw, (assets)),
-            abi.encodeCall(vault.withdraw, (assets, u, u)),
-            u,
-            _burnUnitRef() == 0
-        );
+        (bool ok, uint256 burned) =
+            _quoted(abi.encodeCall(vault.previewWithdraw, (assets)), abi.encodeCall(vault.withdraw, (assets, u, u)), u);
         _scoreRedeem(ok, burned, held, true);
         withdrawGemOps++;
     }
@@ -617,10 +602,7 @@ contract VaultAdversarialHandler is Test {
         shares = bound(shares, 1, bal);
         uint256 held = wsgem.balanceOf(address(vault));
         (bool ok,) = _quoted(
-            abi.encodeCall(vault.previewRedeemToWsgem, (shares)),
-            abi.encodeCall(vault.redeemToWsgem, (shares, u, u)),
-            u,
-            false
+            abi.encodeCall(vault.previewRedeemToWsgem, (shares)), abi.encodeCall(vault.redeemToWsgem, (shares, u, u)), u
         );
         _scoreRedeem(ok, shares, held, false);
         redeemWsgemOps++;
@@ -861,8 +843,7 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         if (held >= supply) assertEq(price, nav, "fully backed prices at nav");
     }
 
-    /// @dev Quotes never revert in any reachable state (previewWithdraw excepted while the
-    /// exit unit is zero).
+    /// @dev Quotes never revert in any reachable state.
     function invariant_QuotesNeverRevert() public view {
         vault.totalAssets();
         vault.convertToShares(1e18);
@@ -872,8 +853,7 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         vault.previewRedeem(1e18);
         vault.previewRedeemToWsgem(1e18);
         vault.previewDepositWsgem(1e18);
-        uint256 unit = wsgem.navprice() == 0 ? vault.lastBurnUnit() : wsgem.burncost();
-        if (unit != 0) vault.previewWithdraw(1e18);
+        vault.previewWithdraw(1e18);
     }
 
     /// @dev Anti-vacuity: a deterministic walk through every adversarial state, checking

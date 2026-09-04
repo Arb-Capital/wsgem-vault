@@ -265,6 +265,14 @@ contract WsgemVaultTest is VaultTestBase {
         assertEq(vault.lastNav(), initNavprice);
     }
 
+    function test_OracleLive_TracksPause() public {
+        assertTrue(vault.oracleLive());
+        pip.pause();
+        assertFalse(vault.oracleLive());
+        pip.poke(1.2e18);
+        assertTrue(vault.oracleLive());
+    }
+
     function test_Mutator_RefreshesFallback() public {
         uint256 s = _depositGem(alice, 100e18);
         pip.poke(1.1e18);
@@ -1297,8 +1305,10 @@ contract WsgemVaultTest is VaultTestBase {
         assertEq(_bc(), 0);
         assertGt(_nav(), 0);
         assertEq(vault.previewRedeem(WAD), 0); // an honest zero
-        vm.expectRevert(_invalidPrice()); // no share count delivers gem
-        vault.previewWithdraw(1);
+        // No share count delivers gem: the impossible quote, never a revert.
+        assertEq(vault.previewWithdraw(1), type(uint256).max);
+        assertEq(vault.previewWithdraw(s), type(uint256).max);
+        assertEq(vault.previewWithdraw(0), 0);
         assertEq(vault.maxRedeem(alice), 0);
         assertEq(vault.maxWithdraw(alice), 0);
         vm.startPrank(alice);

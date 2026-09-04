@@ -108,8 +108,11 @@ All market parameters are governable per instance.
   state-changing call and by the permissionless `sync()`), so integrators keep a price
   rather than a revert or a zero. `max*` report 0 for the gem legs (the wsgem's own
   mint/redeem are frozen) and execution of those legs reverts `InvalidPrice`; the wsgem
-  legs stay live. Keepers that poke the NAV should call `sync()` afterwards so the fallback
-  never lags the last live price.
+  legs stay live. Accepted: a pause does **not** make that fallback a safe price — it is
+  whatever the last mutation or `sync()` saw, which may predate the pause by any number of
+  pokes, or be the very value the pause was meant to withdraw. Integrators that must not
+  price on it check `oracleLive()` and fail closed themselves (the Pendle SY does); keepers
+  should `sync()` in the same transaction as every NAV update so the fallback never lags.
 - **`convertToAssets` overvalues shares by `bpsout` relative to a gem exit.** Anything that
   prices shares off `convertToAssets` (PT oracles, LTVs) is 25 bps above what a gem
   redemption pays right now; at that size it is absorbed by any sane LTV or liquidation

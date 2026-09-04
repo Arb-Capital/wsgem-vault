@@ -35,7 +35,12 @@ import {IWsgemVault} from "./interfaces/IWsgemVault.sol";
 ///   - `totalAssets`, `convertTo*` and every `preview*` are pure quotes: they never revert
 ///     for operational reasons and never account for limits. They read the oracle live and,
 ///     while it is paused, fall back to the values last observed live (`lastNav` and the
-///     fee units; refreshed on every state-changing call and by `sync()`).
+///     fee units; refreshed on every state-changing call and by `sync()`). Accepted: a
+///     pause does NOT make that fallback a safe price — it is whatever the last mutation or
+///     `sync()` saw, which may predate the pause by any number of pokes, or be the very
+///     value the pause was meant to withdraw. Integrators that must not price on it check
+///     `oracleLive()` and fail closed themselves (the Pendle SY does); keepers should
+///     `sync()` in the same transaction as every NAV update so the fallback never lags.
 ///   - `max*` never revert and report 0 while a leg is unavailable (deposits: deficit,
 ///     mint window closed, vault deny-listed, oracle paused, capacity exhausted; gem-out:
 ///     cooldown, burn window closed, vault deny-listed, oracle paused, gem liquidity, the
@@ -212,13 +217,14 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
         return _wsgemForShares(shares).mulDiv(_burnUnitRef(), WAD);
     }
 
-    /// @dev The fewest shares whose redemption delivers at least `assets`; ceil. Reverts
-    /// only while the exit unit is zero (the exit fee is the whole price), when no share
-    /// count delivers gem.
+    /// @dev The fewest shares whose redemption delivers at least `assets`; ceil. While the
+    /// exit unit is zero (the exit fee is the whole price) no share count delivers gem, so
+    /// the quote is `type(uint256).max` — the same answer as when nothing backs the shares —
+    /// rather than a revert, and `maxWithdraw` is 0.
     function previewWithdraw(uint256 assets) public view returns (uint256) {
         if (assets == 0) return 0;
         uint256 unit = _burnUnitRef();
-        if (unit == 0) revert IWsgem.InvalidPrice();
+        if (unit == 0) return type(uint256).max;
         return _sharesForWsgem(assets.mulDiv(WAD, unit, Math.Rounding.Up), Math.Rounding.Up);
     }
 
@@ -331,6 +337,11 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     /// @inheritdoc IWsgemVault
     function sync() external {
         if (!_sync()) revert IWsgem.InvalidPrice();
+    }
+
+    /// @inheritdoc IWsgemVault
+    function oracleLive() public view returns (bool) {
+        return IWsgem(wsgem).navprice() != 0;
     }
 
     /// @dev Refreshes the oracle-pause fallback values from a live oracle; no-op while paused.

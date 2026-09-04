@@ -251,20 +251,17 @@ abstract contract VaultTestBase is Test {
                              QUOTE HONESTY
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Quotes never lie, ERC-4626 style: a preview is a pure quote that may revert only
-    /// when its execution (as `caller`) reverts too, and whenever the execution succeeds its
-    /// result equals the quote. Execution may revert while the quote succeeds — that is
-    /// what `max*` and the execution gates are for.
+    /// @dev Quotes never lie, ERC-4626 style: a preview is a pure quote that never reverts,
+    /// and whenever its execution (as `caller`) succeeds the result equals the quote.
+    /// Execution may revert while the quote stands — that is what `max*` and the execution
+    /// gates are for.
     function _assertQuoteHonest(address target, bytes memory previewCall, bytes memory execCall, address caller)
         internal
     {
         (bool pOk, bytes memory pRet) = target.staticcall(previewCall);
+        assertTrue(pOk, "quote reverted");
         vm.prank(caller);
         (bool eOk, bytes memory eRet) = target.call(execCall);
-        if (!pOk) {
-            assertFalse(eOk, "quote reverted but execution succeeded");
-            return;
-        }
         if (eOk) {
             assertEq(abi.decode(eRet, (uint256)), abi.decode(pRet, (uint256)), "execution differs from quote");
         }

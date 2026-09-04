@@ -50,6 +50,10 @@ interface IWsgemVault {
     /// @notice Refresh the fallback values from the live oracle. Permissionless; reverts
     /// `InvalidPrice` while the oracle is paused. Every state-changing call also refreshes.
     function sync() external;
+    /// @notice Whether quotes are reading the live oracle rather than the fallback.
+    /// Integrators that must not price on a fallback value check this and fail closed: the
+    /// fallback is only as fresh as the last mutation or `sync()`.
+    function oracleLive() external view returns (bool);
 
     function maxDepositWsgem(address receiver) external view returns (uint256 maxWsgemIn);
     function maxRedeemToWsgem(address owner) external view returns (uint256 maxShares);
