@@ -2,5 +2,25 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 1_000_000
+auto_detect_remappings = false
+# forge >= 1.0 removed `testFail*`; the vendored a16z ERC-4626 property suite still declares
+# `testFail_withdraw` / `testFail_redeem`. Their intent (operator without allowance) is covered
+# by the `*_WithoutAllowance_Reverts` tests in test/WsgemVault.t.sol. Anchored to exactly those
+# two signatures (forge matches filters against the full signature, hence the `[(]`) so a
+# future `testFail*` in this repo surfaces instead of being silently excluded.
+no_match_test = "^testFail_(withdraw|redeem)[(]"
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+[profile.default.fuzz]
+runs = 1024
+
+[profile.default.invariant]
+runs = 128
+depth = 64
+fail_on_revert = false
+
+[rpc_endpoints]
+mainnet = "${ETH_RPC_URL}"
