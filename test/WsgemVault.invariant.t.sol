@@ -342,7 +342,7 @@ contract WsgemVaultInvariantTest is VaultTestBase {
 //////////////////////////////////////////////////////////////*/
 
 /// @notice Adds every governable and privileged lever (smelt, oracle pause, market pause,
-/// cooldown, capacity, liquidity drain) and scores every deposit/redeem op for QUOTE
+/// cooldown, capacity, liquidity drain, reverting feed) and scores every deposit/redeem op for QUOTE
 /// HONESTY, ERC-4626 style: a quote never reverts, execution may revert on a gate while the
 /// quote stands, and whenever execution succeeds its result equals the quote. Violations
 /// are counted, never asserted
@@ -363,6 +363,7 @@ contract VaultAdversarialHandler is Test {
     // Ghosts.
     uint256 public ghostNavprice; // last non-zero poke
     bool public ghostPaused;
+    bool public ghostFeedBroken; // a wsgem feed currently reverts (bpsout filed above 10000)
     uint256 public ghostSmelted; // wsgem burned out of the vault by the issuer
     uint256 public ghostHealed; // wsgem donated back into the vault
     uint256 public ghostWsgemIn; // wsgem that entered through the deposit legs (incl. mint excess)
@@ -378,6 +379,7 @@ contract VaultAdversarialHandler is Test {
     uint256 public claimDangling;
     uint256 public priceMovedOffPoke;
     uint256 public syncLagged;
+    uint256 public syncOnBrokenFeed;
 
     // Op liveness counters (op ran to its end, whatever the outcome).
     uint256 public depositGemOps;
@@ -401,6 +403,8 @@ contract VaultAdversarialHandler is Test {
     uint256 public setCapacityOps;
     uint256 public clearCapacityOps;
     uint256 public pokeOps;
+    uint256 public breakFeedOps;
+    uint256 public repairFeedOps;
 
     // Outcome counters (how often each state actually bit; for the wiring test).
     uint256 public depositsBlocked;
@@ -458,10 +462,17 @@ contract VaultAdversarialHandler is Test {
         return a < b ? a : b;
     }
 
+    /// @dev `previewRedeem(shares)`, or 0 while its feed reverts.
+    function _previewRedeemOrZero(uint256 shares) internal view returns (uint256) {
+        (bool ok, bytes memory ret) = address(vault).staticcall(abi.encodeCall(vault.previewRedeem, (shares)));
+        return ok ? abi.decode(ret, (uint256)) : 0;
+    }
+
     /// @dev Quote first, execute second (as `caller`), and score the pair for honesty: a
     /// quote never reverts, and a standing quote must equal a successful execution's
-    /// result. Returns the amount on success.
-    function _quoted(bytes memory previewCall, bytes memory execCall, address caller)
+    /// result. A `feedFree` quote must stand even while a feed reverts; the others may
+    /// revert with the feed. Returns the amount on success.
+    function _quoted(bytes memory previewCall, bytes memory execCall, address caller, bool feedFree)
         internal
         returns (bool ok, uint256 value)
     {
@@ -469,7 +480,7 @@ contract VaultAdversarialHandler is Test {
         vm.prank(caller);
         (bool eOk, bytes memory eRet) = address(vault).call(execCall);
         if (!pOk) {
-            quoteReverted++;
+            if (feedFree || !ghostFeedBroken) quoteReverted++;
             return (false, 0);
         }
         if (!eOk) return (false, 0);
@@ -523,8 +534,9 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         gem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) =
-            _quoted(abi.encodeCall(vault.previewDeposit, (assets)), abi.encodeCall(vault.deposit, (assets, u)), u);
+        (bool ok,) = _quoted(
+            abi.encodeCall(vault.previewDeposit, (assets)), abi.encodeCall(vault.deposit, (assets, u)), u, false
+        );
         _scoreDeposit(ok, inDeficit);
         depositGemOps++;
     }
@@ -537,7 +549,8 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         gem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) = _quoted(abi.encodeCall(vault.previewMint, (shares)), abi.encodeCall(vault.mint, (shares, u)), u);
+        (bool ok,) =
+            _quoted(abi.encodeCall(vault.previewMint, (shares)), abi.encodeCall(vault.mint, (shares, u)), u, false);
         _scoreDeposit(ok, inDeficit);
         mintSharesOps++;
     }
@@ -553,8 +566,9 @@ contract VaultAdversarialHandler is Test {
         vm.prank(u);
         wsgem.approve(address(vault), type(uint256).max);
         bool inDeficit = vault.deficit() != 0;
-        (bool ok,) =
-            _quoted(abi.encodeCall(vault.previewDepositWsgem, (amt)), abi.encodeCall(vault.depositWsgem, (amt, u)), u);
+        (bool ok,) = _quoted(
+            abi.encodeCall(vault.previewDepositWsgem, (amt)), abi.encodeCall(vault.depositWsgem, (amt, u)), u, true
+        );
         _scoreDeposit(ok, inDeficit);
         depositWsgemOps++;
     }
@@ -568,8 +582,9 @@ contract VaultAdversarialHandler is Test {
         }
         shares = bound(shares, 1, bal);
         uint256 held = wsgem.balanceOf(address(vault));
-        (bool ok,) =
-            _quoted(abi.encodeCall(vault.previewRedeem, (shares)), abi.encodeCall(vault.redeem, (shares, u, u)), u);
+        (bool ok,) = _quoted(
+            abi.encodeCall(vault.previewRedeem, (shares)), abi.encodeCall(vault.redeem, (shares, u, u)), u, false
+        );
         _scoreRedeem(ok, shares, held, true);
         redeemGemOps++;
     }
@@ -583,11 +598,12 @@ contract VaultAdversarialHandler is Test {
         }
         // Bound to what the balance quotes for so a failure is a vault gate, not "burn
         // amount exceeds balance".
-        uint256 cap = vault.previewRedeem(bal);
+        uint256 cap = _previewRedeemOrZero(bal);
         assets = bound(assets, 1, cap == 0 ? 1 : cap);
         uint256 held = wsgem.balanceOf(address(vault));
-        (bool ok, uint256 burned) =
-            _quoted(abi.encodeCall(vault.previewWithdraw, (assets)), abi.encodeCall(vault.withdraw, (assets, u, u)), u);
+        (bool ok, uint256 burned) = _quoted(
+            abi.encodeCall(vault.previewWithdraw, (assets)), abi.encodeCall(vault.withdraw, (assets, u, u)), u, false
+        );
         _scoreRedeem(ok, burned, held, true);
         withdrawGemOps++;
     }
@@ -602,7 +618,10 @@ contract VaultAdversarialHandler is Test {
         shares = bound(shares, 1, bal);
         uint256 held = wsgem.balanceOf(address(vault));
         (bool ok,) = _quoted(
-            abi.encodeCall(vault.previewRedeemToWsgem, (shares)), abi.encodeCall(vault.redeemToWsgem, (shares, u, u)), u
+            abi.encodeCall(vault.previewRedeemToWsgem, (shares)),
+            abi.encodeCall(vault.redeemToWsgem, (shares, u, u)),
+            u,
+            true
         );
         _scoreRedeem(ok, shares, held, false);
         redeemWsgemOps++;
@@ -750,6 +769,14 @@ contract VaultAdversarialHandler is Test {
             syncOracleOps++;
             return;
         }
+        if (ghostFeedBroken) {
+            // sync() must fail closed rather than refresh from a reverting feed.
+            try vault.sync() {
+                syncOnBrokenFeed++;
+            } catch {}
+            syncOracleOps++;
+            return;
+        }
         vault.sync();
         if (vault.lastNav() != wsgem.navprice()) syncLagged++;
         syncOracleOps++;
@@ -761,6 +788,20 @@ contract VaultAdversarialHandler is Test {
         ghostNavprice = nav;
         ghostPaused = false;
         pokeOps++;
+    }
+
+    /// @dev `MaseerGate.file` is unbounded, so governance can file a bpsout above 10000 and
+    /// `burncost()` then underflows: every read of it reverts until repaired.
+    function breakFeed() external priceStable {
+        act.file("bpsout", 10_001);
+        ghostFeedBroken = true;
+        breakFeedOps++;
+    }
+
+    function repairFeed(uint256 bps) external priceStable {
+        act.setBpsout(bound(bps, 0, 500));
+        ghostFeedBroken = false;
+        repairFeedOps++;
     }
 
     function pauseMarket() external priceStable {
@@ -818,6 +859,7 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         assertEq(handler.claimDangling(), 0, "queued claim owned by vault");
         assertEq(handler.priceMovedOffPoke(), 0, "share price moved without a poke");
         assertEq(handler.syncLagged(), 0, "sync() left the fallback lagging");
+        assertEq(handler.syncOnBrokenFeed(), 0, "sync() refreshed from a reverting feed");
     }
 
     function invariant_NoDanglingClaims() public view {
@@ -843,16 +885,18 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         if (held >= supply) assertEq(price, nav, "fully backed prices at nav");
     }
 
-    /// @dev Quotes never revert in any reachable state.
+    /// @dev Quotes never revert in any reachable state, except that a reverting feed takes
+    /// the quotes reading it down with it; the wsgem-leg quotes stand regardless.
     function invariant_QuotesNeverRevert() public view {
+        vault.previewRedeemToWsgem(1e18);
+        vault.previewDepositWsgem(1e18);
+        if (handler.ghostFeedBroken()) return;
         vault.totalAssets();
         vault.convertToShares(1e18);
         vault.convertToAssets(1e18);
         vault.previewDeposit(1e18);
         vault.previewMint(1e18);
         vault.previewRedeem(1e18);
-        vault.previewRedeemToWsgem(1e18);
-        vault.previewDepositWsgem(1e18);
         vault.previewWithdraw(1e18);
     }
 
@@ -926,6 +970,26 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         handler.redeemGem(0, 1e18);
         assertEq(handler.redeemsServed(), served + 1, "gem-out after refill");
 
+        // Reverting feed (bpsout filed above 10000): gem-out and sync() fail closed, the
+        // wsgem legs and gem-in are served, the fallback is untouched; then repaired.
+        handler.syncOracle();
+        uint256 navCache = vault.lastNav();
+        handler.breakFeed();
+        blocked = handler.redeemsBlocked();
+        handler.redeemGem(0, 1e18);
+        handler.withdrawGem(0, 1e18);
+        assertEq(handler.redeemsBlocked(), blocked + 2, "gem-out not blocked by a reverting feed");
+        handler.syncOracle(); // reverts inside; scored by syncOnBrokenFeed
+        served = handler.redeemsServed();
+        handler.redeemWsgem(0, 1e18);
+        assertEq(handler.redeemsServed(), served + 1, "wsgem leg not live under a reverting feed");
+        served = handler.depositsServed();
+        handler.depositWsgem(0, 2e18);
+        handler.depositGem(0, 2e18);
+        assertEq(handler.depositsServed(), served + 2, "deposit legs not live under a reverting feed");
+        assertEq(vault.lastNav(), navCache, "fallback touched by a reverting feed");
+        handler.repairFeed(25);
+
         // Market pause / reopen, capacity set / clear, poke + sync, and max* in every state.
         handler.pauseMarket();
         blocked = handler.depositsBlocked();
@@ -946,12 +1010,12 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         }
 
         // Every op ran.
-        assertEq(handler.depositGemOps(), 4);
+        assertEq(handler.depositGemOps(), 5);
         assertEq(handler.mintSharesOps(), 2);
-        assertEq(handler.depositWsgemOps(), 2);
-        assertEq(handler.redeemGemOps(), 4);
-        assertEq(handler.withdrawGemOps(), 1);
-        assertEq(handler.redeemWsgemOps(), 2);
+        assertEq(handler.depositWsgemOps(), 3);
+        assertEq(handler.redeemGemOps(), 5);
+        assertEq(handler.withdrawGemOps(), 2);
+        assertEq(handler.redeemWsgemOps(), 3);
         assertEq(handler.exerciseMaxOps(), 10);
         assertEq(handler.smeltOps(), 1);
         assertEq(handler.healOps(), 1);
@@ -961,12 +1025,14 @@ contract WsgemVaultAdversarialInvariantTest is VaultTestBase {
         assertEq(handler.clearCooldownOps(), 1);
         assertEq(handler.pauseOracleOps(), 1);
         assertEq(handler.unpauseOracleOps(), 1);
-        assertEq(handler.syncOracleOps(), 3);
+        assertEq(handler.syncOracleOps(), 5);
         assertEq(handler.pauseMarketOps(), 1);
         assertEq(handler.reopenMarketOps(), 1);
         assertEq(handler.setCapacityOps(), 1);
         assertEq(handler.clearCapacityOps(), 1);
         assertEq(handler.pokeOps(), 1);
+        assertEq(handler.breakFeedOps(), 1);
+        assertEq(handler.repairFeedOps(), 1);
 
         // And nothing was ever violated.
         invariant_FailClosedEnforced();

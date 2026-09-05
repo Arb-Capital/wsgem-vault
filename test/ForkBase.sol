@@ -4,8 +4,8 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 
 /// @notice Fork-test gating: suites run only when an explicit RPC is configured
-/// (`ETH_RPC_URL`, or `ALCHEMY_API_KEY` to compose one) and skip otherwise, so plain
-/// offline `forge test` stays green and never leans on a rate-limited public endpoint.
+/// (`ETH_RPC_URL`, or `ALCHEMY_API_KEY` to compose one) and skip otherwise, unless
+/// REQUIRE_FORK is set by an explicit fork/smoke or release command.
 abstract contract ForkBase is Test {
     bool internal skipFork;
 
@@ -25,6 +25,7 @@ abstract contract ForkBase is Test {
             }
         }
         if (bytes(url).length == 0) {
+            require(!vm.envOr("REQUIRE_FORK", false), "Fork tests require ETH_RPC_URL or ALCHEMY_API_KEY");
             skipFork = true;
             return false;
         }
@@ -33,6 +34,8 @@ abstract contract ForkBase is Test {
         } else {
             vm.createSelectFork(url, blockNumber);
         }
+        require(block.chainid == 1, "Fork tests require Ethereum mainnet");
+        emit log_named_uint("Fork block", block.number);
         return true;
     }
 }

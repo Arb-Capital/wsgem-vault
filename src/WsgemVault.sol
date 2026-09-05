@@ -10,6 +10,7 @@ import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IWsgem} from "./interfaces/IWsgem.sol";
 import {IWsgemVault} from "./interfaces/IWsgemVault.sol";
+import {IGemPausable} from "./interfaces/IGemPausable.sol";
 
 /// @title WsgemVault
 /// @notice Immutable ERC-4626 vault over a wsgem token. Holds wsgem, issues one 18-decimal
@@ -27,11 +28,14 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     using Math for uint256;
 
     uint256 internal constant WAD = 1e18;
+    uint256 internal constant READ_GAS_LIMIT = 50_000;
 
     /// @inheritdoc IWsgemVault
     address public immutable wsgem;
     /// @inheritdoc IWsgemVault
     address public immutable gem;
+    /// @inheritdoc IWsgemVault
+    bool public immutable gemPausable;
 
     /// @inheritdoc IWsgemVault
     uint256 public lastNav;
@@ -48,6 +52,8 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
         if (wsgemDecimals != 18) revert WsgemDecimals(wsgemDecimals);
         wsgem = wsgem_;
         gem = IWsgem(wsgem_).gem();
+        (bool pauseOk, uint256 paused) = _tryReadWord(gem, IGemPausable.paused.selector);
+        gemPausable = pauseOk && paused <= 1;
         IERC20(gem).forceApprove(wsgem_, type(uint256).max);
         if (!_sync()) revert IWsgem.InvalidPrice();
     }
@@ -63,6 +69,16 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
 
     function asset() external view returns (address) {
         return gem;
+    }
+
+    /// @inheritdoc IWsgemVault
+    function gemTransfersAvailable() public view returns (bool) {
+        if (gemPausable) {
+            (bool ok, uint256 paused) = _tryReadWord(gem, IGemPausable.paused.selector);
+            if (!ok || paused != 0) return false;
+        }
+        IWsgem w = IWsgem(wsgem);
+        return w.canPass(address(this)) && w.canPass(wsgem);
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -285,13 +301,16 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
         return IWsgem(wsgem).navprice() != 0;
     }
 
-    /// @dev Refreshes the fallback values from a live oracle; returns false while paused.
+    /// @dev Refreshes the fallback values from a live oracle; returns false, leaving them
+    /// untouched, while the oracle is paused or a feed fails, returns malformed data,
+    /// or exceeds its gas budget. The three values are committed together.
     function _sync() internal returns (bool live) {
-        IWsgem w = IWsgem(wsgem);
-        uint256 nav = w.navprice();
-        if (nav == 0) return false;
-        uint256 mintUnit = w.mintcost();
-        uint256 burnUnit = w.burncost();
+        (bool navOk, uint256 nav) = _tryReadWord(wsgem, IWsgem.navprice.selector);
+        if (!navOk || nav == 0) return false;
+        (bool mintOk, uint256 mintUnit) = _tryReadWord(wsgem, IWsgem.mintcost.selector);
+        if (!mintOk) return false;
+        (bool burnOk, uint256 burnUnit) = _tryReadWord(wsgem, IWsgem.burncost.selector);
+        if (!burnOk) return false;
         if (nav != lastNav || mintUnit != lastMintUnit || burnUnit != lastBurnUnit) {
             lastNav = nav;
             lastMintUnit = mintUnit;
@@ -299,6 +318,19 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
             emit Sync(nav, mintUnit, burnUnit);
         }
         return true;
+    }
+
+    /// @dev Fixed gas and output size: neither a gas-burning callee nor a return-data
+    /// bomb can make an optional refresh consume unbounded caller resources.
+    function _tryReadWord(address target, bytes4 selector) internal view returns (bool ok, uint256 value) {
+        uint256 gasLimit = READ_GAS_LIMIT;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            ok := staticcall(gasLimit, target, ptr, 4, ptr, 32)
+            ok := and(ok, eq(returndatasize(), 32))
+            value := mload(ptr)
+        }
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -384,7 +416,7 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     /// `assets` with `floor(assets * 1e18 / mintcost()) <= headroom`.
     function _maxDepositAssets() internal view returns (uint256 assets, uint256 unit) {
         IWsgem w = IWsgem(wsgem);
-        if (deficit() != 0 || !w.mintable() || !w.canPass(address(this))) return (0, 0);
+        if (deficit() != 0 || !w.mintable() || !gemTransfersAvailable()) return (0, 0);
         unit = w.mintcost();
         if (unit == 0) return (0, 0);
         uint256 supply = w.totalSupply();
@@ -401,7 +433,7 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     /// floor.
     function _maxRedeemShares(address owner) internal view returns (uint256 shares, uint256 unit) {
         IWsgem w = IWsgem(wsgem);
-        if (w.cooldown() != 0 || !w.burnable() || !w.canPass(address(this))) return (0, 0);
+        if (w.cooldown() != 0 || !w.burnable() || !gemTransfersAvailable()) return (0, 0);
         unit = w.burncost();
         if (unit == 0) return (0, 0);
         shares = balanceOf(owner);

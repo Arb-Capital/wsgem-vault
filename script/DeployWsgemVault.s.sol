@@ -63,10 +63,9 @@ contract DeployWsgemVault is Script {
     {
         require(bytes(name).length != 0, "VAULT_NAME required");
         require(bytes(symbol).length != 0, "VAULT_SYMBOL required");
-        require(expectedGem != address(0), "EXPECTED_GEM required");
+        _validateTarget(wsgem, expectedGem);
 
-        // Pre-deploy sanity: right underlying, oracle alive.
-        require(IWsgem(wsgem).gem() == expectedGem, "wsgem.gem() != EXPECTED_GEM");
+        // Pre-deploy sanity: oracle alive.
         require(IWsgem(wsgem).navprice() > 0, "oracle paused");
 
         vm.startBroadcast();
@@ -93,16 +92,20 @@ contract DeployWsgemVault is Script {
     /// @param holder an account whose `max*` are exercised against its balance, or
     /// address(0) for the balance-independent checks only.
     function check(address vaultAddr, address wsgem, address expectedGem, address holder) public view {
+        _validateTarget(wsgem, expectedGem);
+        _sanity(WsgemVault(vaultAddr), wsgem, holder);
+    }
+
+    function _validateTarget(address wsgem, address expectedGem) internal view virtual {
         require(expectedGem != address(0), "EXPECTED_GEM required");
         require(IWsgem(wsgem).gem() == expectedGem, "wsgem.gem() != EXPECTED_GEM");
-        _sanity(WsgemVault(vaultAddr), wsgem, holder);
     }
 
     /*//////////////////////////////////////////////////////////////
                               BATTERY
     //////////////////////////////////////////////////////////////*/
 
-    function _sanity(WsgemVault vault, address wsgem, address holder) internal view {
+    function _sanity(WsgemVault vault, address wsgem, address holder) internal view virtual {
         IWsgem w = IWsgem(wsgem);
         address gem = w.gem();
 
@@ -112,8 +115,9 @@ contract DeployWsgemVault is Script {
         require(vault.decimals() == 18, "vault decimals");
         require(vault.asset() == gem, "vault asset");
         require(vault.gem() == gem, "vault gem");
-        // Screened next: a deny-listed vault makes every preview below revert NotAuthorized.
+        // Operational checks are distinct from the price quotes.
         require(w.canPass(address(vault)), "vault fails compliance screen");
+        require(vault.gemTransfersAvailable(), "gem transfers unavailable");
         require(vault.deficit() == 0, "deficit != 0");
 
         uint256 nav = w.navprice();

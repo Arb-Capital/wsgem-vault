@@ -74,11 +74,11 @@ test :; @$(OFFLINE) forge test -vvv
 # Deterministic pinned-block fork suites (vault behaviour against live wstGBP, plus the
 # pinned wstGBP deploy script). Needs an archive-capable RPC (any Alchemy/Infura endpoint;
 # the public fallback often 403s archive requests). FORK_BLOCK overrides the pin.
-test-fork :; forge test -vvv --match-contract 'ForkTest$$'
+test-fork :; REQUIRE_FORK=true forge test -vvv --match-contract 'ForkTest$$'
 
 # Latest-block live-parameter smoke checks: a failure means live wsgem config or gem
 # liquidity moved (fees, cooldown, market windows, compliance), not a code regression.
-test-smoke :; forge test -vvv --match-contract 'SmokeTest$$'
+test-smoke :; REQUIRE_FORK=true forge test -vvv --match-contract 'SmokeTest$$'
 
 # Everything the configured RPC allows; offline it degrades to `make test` (fork/smoke skip).
 test-all :; forge test -vvv
@@ -123,19 +123,16 @@ deploy :
 		$(if $(ETH_GAS_PRICE),--with-gas-price $(ETH_GAS_PRICE)) \
 		--broadcast --slow --verify --etherscan-api-key $(ETHERSCAN_API_KEY)
 
-# Etherscan-verify an already-broadcast deploy whose inline --verify hiccuped: resumes the
-# recorded broadcast, so constructor args / metadata come from run-latest.json — no re-deploy.
-# Forge requires `--broadcast` + the deployer wallet alongside `--resume` (it validates wallet
-# mappings up front), but SENDS NOTHING: every tx in the record is already mined, so this only
-# submits the Etherscan verification. Use the same ETH_FROM/ETH_KEYSTORE that deployed.
+# Verify an explicit mined address, with constructor arguments extracted from its on-chain
+# creation code. No signing wallet or transaction-submitting script is involved.
+# Usage: make verify VAULT=0x... (CHAIN defaults to mainnet for the pinned instance).
+CHAIN ?= mainnet
 verify :
-	@test -n "$(ETH_RPC_URL)" || { echo "ETH_RPC_URL is required"; exit 1; }
-	@test -n "$(ETH_FROM)" || { echo "ETH_FROM (the deployer address) is required"; exit 1; }
-	@test -n "$(ETH_KEYSTORE)" || { echo "ETH_KEYSTORE (keystore JSON path) is required"; exit 1; }
+	@test -n "$(VAULT)" || { echo "VAULT (deployed address) is required"; exit 1; }
 	@test -n "$(ETHERSCAN_API_KEY)" || { echo "ETHERSCAN_API_KEY is required"; exit 1; }
-	@forge script $(SCRIPT) --rpc-url $(ETH_RPC_URL) \
-		--sender $(ETH_FROM) --keystore $(ETH_KEYSTORE) \
-		--broadcast --resume --verify --etherscan-api-key $(ETHERSCAN_API_KEY)
+	@$(KEYLESS) forge verify-contract "$(VAULT)" src/WsgemVault.sol:WsgemVault \
+		--chain "$(CHAIN)" --rpc-url "$(or $(ETH_RPC_URL),$(PUBLIC_RPC))" \
+		--guess-constructor-args --watch
 
 # Post-broadcast / any-time health check against a live vault (view-only, keyless): the full
 # sanity battery — bindings, rate, previews, max*, deficit()==0, and which legs are open.

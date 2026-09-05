@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {DeployWsgemVault} from "./DeployWsgemVault.s.sol";
+import {WsgemVault} from "../src/WsgemVault.sol";
 
 /// @notice The wstGBP vault deployment: every parameter of the live Ethereum mainnet
 /// instance, pinned in code. Nothing has to be exported to run it — that is the point.
@@ -40,6 +41,7 @@ contract DeployWstGbpVault is DeployWsgemVault {
     string public constant VAULT_SYMBOL = "vwstGBP";
 
     function target() public view override returns (address wsgem, address expectedGem) {
+        require(block.chainid == 1, "Ethereum mainnet required");
         _requirePinned("WSGEM", WSTGBP);
         _requirePinned("EXPECTED_GEM", TGBP);
         return (WSTGBP, TGBP);
@@ -49,5 +51,16 @@ contract DeployWstGbpVault is DeployWsgemVault {
         _requirePinned("VAULT_NAME", VAULT_NAME);
         _requirePinned("VAULT_SYMBOL", VAULT_SYMBOL);
         return (VAULT_NAME, VAULT_SYMBOL);
+    }
+
+    function _validateTarget(address wsgem, address expectedGem) internal view override {
+        require(block.chainid == 1, "Ethereum mainnet required");
+        require(wsgem == WSTGBP && expectedGem == TGBP, "wrong pinned instance");
+        super._validateTarget(wsgem, expectedGem);
+    }
+
+    function _sanity(WsgemVault vault, address wsgem, address holder) internal view override {
+        require(vault.gemPausable(), "tGBP pause interface missing");
+        super._sanity(vault, wsgem, holder);
     }
 }

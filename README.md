@@ -33,7 +33,8 @@ wsgem ◄─redeemToWsgem       (1:1, fee-free)───────────
 - **Gem in** (`deposit`, `mint`) replicates `wsgem.mint()` share for share; **gem out**
   (`redeem`, `withdraw`) replicates `wsgem.redeem()` gem for gem.
 - **wsgem legs** (`depositWsgem`, `redeemToWsgem`, with their `preview*` / `max*`) are 1:1,
-  fee-free, and never read the oracle. Their errors and events live in `IWsgemVault`.
+  fee-free, and priced without the oracle. They attempt a bounded cache refresh; a failed
+  refresh does not block execution. Their errors and events live in `IWsgemVault`.
 - The stack is agnostic to gem decimals (they live inside the oracle price scaling).
 
 ## Pricing principles
@@ -61,11 +62,11 @@ also covers rate-update sniping: one NAV step is far smaller than the exit fee, 
 via the wsgem leg instead is just a plain mint.
 
 **Quotes, limits and execution are split the ERC-4626 way.** `totalAssets`, `convertTo*`
-and every `preview*` are pure quotes: they never revert for operational reasons, never
+and every `preview*` are pure quotes: they do not enforce operational gates, never
 account for limits, and a successful execution always returns exactly its quote. `max*`
-never revert and are tight: they report 0 while a leg is unavailable (deficit, closed
-window, deny-listed vault, paused oracle or exhausted capacity for gem-in; cooldown, closed
-window, deny-listed vault, paused oracle, gem liquidity or the wsgem's one-whole-wsgem floor
+are tight while their dependencies respond: they report 0 while a leg is unavailable (deficit, closed
+window, deny-listed vault/wsgem, paused gem/oracle or exhausted capacity for gem-in; cooldown, closed
+window, deny-listed vault/wsgem, paused gem/oracle, gem liquidity or the wsgem's one-whole-wsgem floor
 for gem-out), else the largest amount that succeeds — `deposit(maxDeposit)`,
 `mint(maxMint)`, `withdraw(maxWithdraw)` and `redeem(maxRedeem)` always succeed, and one
 unit more always reverts. The one exception is unlimited wsgem capacity, where
@@ -113,6 +114,11 @@ All market parameters are governable per instance.
   pokes, or be the very value the pause was meant to withdraw. Integrators that must not
   price on it check `oracleLive()` and fail closed themselves (the Pendle SY does); keepers
   should `sync()` in the same transaction as every NAV update so the fallback never lags.
+  A feed that **reverts** rather than reporting 0 is a different case: quotes, `max*`,
+  and gem-leg execution that require that feed revert with it. The optional refresh limits
+  each call to 50,000 gas and copies only one ABI word; a failed, malformed, or over-budget
+  read leaves the whole cached tuple untouched. The wsgem legs stay live. `oracleLive()`
+  only means nonzero NAV, so integrations must also track the underlying NAV update age.
 - **`convertToAssets` overvalues shares by `bpsout` relative to a gem exit.** Anything that
   prices shares off `convertToAssets` (PT oracles, LTVs) is 25 bps above what a gem
   redemption pays right now; at that size it is absorbed by any sane LTV or liquidation
@@ -125,6 +131,11 @@ All market parameters are governable per instance.
   quote them, and `maxRedeem`/`maxWithdraw` return 0 below the floor. The wsgem legs have
   no minimum. `mint(shares)` for less than roughly one whole share reverts `DustThreshold`
   denominated in gem, because that is the wsgem's error for the implied deposit.
+- **`maxDeposit`/`maxMint` saturate to `type(uint256).max` under unlimited capacity** (the
+  live wstGBP configuration), and that value does not survive a quote: `previewMint` and
+  `convertToAssets` of it overflow and revert once the share price exceeds one gem
+  (`previewDeposit`/`convertToShares` do so while it is below one gem), as OpenZeppelin's
+  `ERC4626` does at a rate above one. Bound the amount before quoting it.
 - **Gem-out is atomic or nothing.** `wsgem.redeem()` queues a claim and pays it inline only
   when the wsgem's cooldown is zero, and then only up to the wsgem's current gem balance; a
   queued or partially filled claim would be owned by the vault with no one to collect it. The
@@ -132,16 +143,26 @@ All market parameters are governable per instance.
   `InsufficientLiquidity` when the wsgem holds less gem than the full claim, `maxRedeem`/
   `maxWithdraw` report 0 or the liquidity-bounded amount, and a defensive post-call check
   (`FillMismatch`) verifies the gem received. The wsgem legs are unaffected by either condition.
-- **Rounding residue.** `withdraw` delivers exactly the requested gem and may leave up to one
-  gem wei per call in the vault (zero for gems with fewer than 18 decimals); `mint` mints
+- **Rounding residue.** `withdraw` delivers exactly the requested gem and may leave at most
+  `ceil(burncost() / 1e18) - 1` gem wei per call in the vault (zero when `burncost() <= 1e18`);
+  `mint` mints
   exactly the requested shares and may leave less than one gem unit's worth of wsgem in the
   vault as surplus backing. Neither is recoverable, neither enters the share price, and the
   surplus only ever offsets a future deficit. `redeem` and `deposit` are exact.
 - **Compliance is an execution gate, not a quote.** Every wsgem transfer screens all
   involved addresses against the gem's deny list, including the vault: if the vault is ever
-  deny-listed, every leg's execution reverts `NotAuthorized` and every `max*` returns 0,
+  deny-listed, positive-amount execution fails and every `max*` returns 0,
   while the quotes are unaffected. Per-address screening of callers and receivers is never
-  previewed. Vault shares are a plain ERC20 (with EIP-2612 permit) and are not gated.
+  previewed. The gem itself also screens transfers and approvals: tGBP rejects banned
+  callers, senders, receivers, and spenders. Gem-in may therefore surface the gem's own
+  error before reaching wsgem. Vault shares are a plain ERC20 (with EIP-2612 permit).
+- **Gem availability is explicit.** `gemTransfersAvailable()` checks the vault and wsgem
+  compliance status and the gem's pause state when detected. `gemPausable()` records whether
+  a valid `paused()` getter was present at construction. For a detected pausable gem,
+  a failing or malformed pause getter makes gem maxima zero. A tGBP pause or ban on wstGBP
+  also makes all gem maxima zero and fails the deployment health check, while wsgem exits
+  remain available if their transfer participants pass compliance. The pinned tGBP script
+  requires pause-interface detection to succeed.
 - **NAV is permissioned and non-monotonic**: the oracle can be poked down or paused to 0.
   NAV moves are discrete steps, so repricing around a poke is sandwichable in principle —
   inherent to any discretely-updated NAV oracle; the exit fee makes cycling through the vault
@@ -157,12 +178,18 @@ All market parameters are governable per instance.
   deficit persists. Donating wsgem to the vault restores full backing and 1:1 quotes for
   everyone remaining.
 - **No admin surface at all.** The vault's only trust assumptions are the wsgem's
-  (permissioned NAV, privileged smelt, upgradeable gate/oracle/guard feeds).
+  (permissioned NAV, privileged smelt, upgradeable gate/oracle/guard feeds). A feed that
+  reverts takes the quotes and gem legs that read it down with it until wsgem governance
+  repairs it; the wsgem legs tolerate a failed bounded refresh and stay live. The gem's own
+  issuer, pause, compliance, and upgrade controls also remain upstream trust dependencies.
 - **Token compatibility assumptions**: the wsgem must follow the Maseer wsgem interface,
   use 18 decimals (enforced at construction), and transfer exact requested amounts. The gem
-  may use any decimals, but it must also transfer exact requested amounts. Fee-on-transfer
-  and rebasing tokens are unsupported: the vault's balance-delta checks would trip and its
-  rounding residue could be consumed.
+  may use any decimals, but it must also transfer exact requested amounts. A pausable gem
+  must expose `paused()` at deployment; gems without that interface must be non-pausable.
+  Adding pause semantics later is an incompatible upgrade requiring a new vault or adapter.
+  Fee-on-transfer, rebasing, and callback-bearing tokens are unsupported. Entry paths trust
+  the requested backing transfer or mint return; only gem redemption verifies a strict
+  received-balance delta, so those checks do not make arbitrary tokens compatible.
 - **Gem decimals only quantize, never break, the math.** navprice/mintcost/burncost are
   quoted in gem native units per whole wsgem, so the share math is decimals-agnostic (tested
   at 2, 6, 8, and 18); low-decimal gems simply round values to their coarser smallest unit.
@@ -186,11 +213,16 @@ even with an RPC configured.
 
 Fork suites run only when an explicit RPC is configured (`ETH_RPC_URL`, or
 `ALCHEMY_API_KEY` to compose one) and **skip otherwise**, so plain offline `forge test`
-stays green. The fork suite pins a block for determinism (override with `FORK_BLOCK`;
+stays green. Explicit `make test-fork` and `make test-smoke` set `REQUIRE_FORK=true` and fail
+if no RPC is configured. Each fork logs its effective block. The fork suite pins a block for determinism (override with `FORK_BLOCK`;
 historical state needs an archive-capable RPC — any Alchemy/Infura endpoint qualifies).
 The smoke suite intentionally forks latest: it asserts current governable parameters
 (fees, cooldown, market windows both ways, compliance) and the wsgem's gem liquidity, so a
-failure there means live config or liquidity moved, not a code regression.
+failure there means live config or liquidity moved, not a code regression. CI pins Foundry
+v1.7.1 and action revisions. For release validation, dispatch CI with `release_checks=true`,
+configure the `ETH_RPC_URL` repository secret with an archive-capable endpoint, and optionally
+set the `WSGEM_FORK_BLOCK` repository variable (default 25589900). That job fails on missing
+RPC configuration and requires a positive historical block.
 
 ### Deploy
 
@@ -198,8 +230,13 @@ failure there means live config or liquidity moved, not a code regression.
 make deploy-dry            # keyless simulation against live mainnet state — run first
 make deploy                # keystore-signed broadcast + inline Etherscan verify
 make check VAULT=0x...     # re-run the sanity battery against the mined vault (keyless)
-make verify                # resume-verify a broadcast whose inline verification hiccuped
+make verify VAULT=0x...    # verify an explicit mined address, without a signing wallet
 ```
+
+`make verify` uses `forge verify-contract`, extracts constructor arguments from on-chain
+creation code, and waits for explorer verification. It requires `VAULT` and
+`ETHERSCAN_API_KEY`, uses the configured RPC or public fallback, and defaults `CHAIN` to
+mainnet. It does not resume a broadcast or use a signing wallet.
 
 `make deploy` signs from an encrypted keystore (`ETH_FROM` + `ETH_KEYSTORE`; forge
 prompts for the password — no raw private key anywhere) and needs `ETHERSCAN_API_KEY`
@@ -212,6 +249,7 @@ There are two deploy scripts, one behaviour:
   configuration; it is what the `make` targets above drive. A `WSGEM`, `EXPECTED_GEM`,
   `VAULT_NAME`, or `VAULT_SYMBOL` left exported for a different instance is **refused**,
   not silently ignored.
+  Both deployment and health-check paths enforce Ethereum chain ID 1 and the pinned pair.
 - **`script/DeployWsgemVault.s.sol`** — the generic pattern for any other wsgem, and the
   deploy/check machinery both share. It defaults **nothing**: `WSGEM`, `EXPECTED_GEM`,
   `VAULT_NAME`, and `VAULT_SYMBOL` must all be set, because a wrong name, symbol, or

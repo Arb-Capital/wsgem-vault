@@ -33,6 +33,14 @@ interface IWsgemVault {
     function wsgem() external view returns (address);
     /// @notice The gem; identical to `IERC4626.asset()`.
     function gem() external view returns (address);
+    /// @notice Whether the gem exposed a valid `paused()` getter at construction.
+    /// Gems without this interface must be non-pausable. Adding pause semantics later
+    /// is an incompatible token upgrade requiring a new vault or an integration adapter.
+    function gemPausable() external view returns (bool);
+    /// @notice Whether the gem's detected pause state and compliance checks for both the
+    /// vault and wsgem permit gem transfers. Excludes prices, markets, and user screening.
+    /// A detected pause getter that subsequently fails is treated as unavailable.
+    function gemTransfersAvailable() external view returns (bool);
     /// @notice Shares outstanding beyond the vault's wsgem balance. Non-zero only after a
     /// privileged burn of the vault's wsgem; while non-zero, deposits revert `Insolvent` and
     /// redemptions pay pro-rata. Cleared by transferring wsgem to the vault.
@@ -45,7 +53,8 @@ interface IWsgemVault {
     /// @notice `burncost()` last observed live; used by quotes while the oracle is paused.
     function lastBurnUnit() external view returns (uint256);
     /// @notice Refreshes the fallback values from the live oracle; reverts `InvalidPrice`
-    /// while paused. Every state-changing call also refreshes them.
+    /// while paused or while a feed reverts. Every state-changing call also refreshes them
+    /// when it can; failed, malformed, or over-budget reads leave the cached tuple untouched.
     function sync() external;
     /// @notice True while quotes read the live oracle rather than the fallback values.
     /// Fallback freshness is not guaranteed; integrations requiring live pricing should

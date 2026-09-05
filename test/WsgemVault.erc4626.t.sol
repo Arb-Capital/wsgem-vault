@@ -79,6 +79,15 @@ contract WsgemVaultERC4626FeeInTest is WsgemVaultERC4626Test {
     }
 }
 
+/// @notice The same suite with no fee either way (`mintcost() == burncost() == navprice()`),
+/// so every round trip runs at zero spread: the floors alone must keep a lap from gaining.
+contract WsgemVaultERC4626NoFeeTest is WsgemVaultERC4626Test {
+    function setUp() public override {
+        super.setUp();
+        act.setBpsout(0);
+    }
+}
+
 /// @notice The same suite around a 6-decimal gem (NAV quoted in gem native units per whole
 /// wsgem, so the seeds and bounds scale with it).
 contract WsgemVaultERC4626Dec6Test is WsgemVaultERC4626Test {

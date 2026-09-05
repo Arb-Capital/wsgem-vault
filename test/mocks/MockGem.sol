@@ -2,8 +2,9 @@
 pragma solidity 0.8.28;
 
 /// @notice Test stand-in for a gem (the underlying currency token, e.g. tGBP): a plain
-/// ERC20 that also carries the `isBanned` deny-list surface MaseerGuardOZ reads for
-/// compliance screening. Gem decimals live entirely inside the oracle price scaling;
+/// ERC20 enforcing tGBP-like pause and transfer/approval deny-list checks, including the
+/// `isBanned` surface MaseerGuardOZ reads. Minting is unrestricted test funding.
+/// Gem decimals live entirely inside the oracle price scaling;
 /// the default harness uses 18 to keep numbers WAD, and the decimals suite passes
 /// 2/6/8 to prove the SY's decimals-agnostic claim.
 contract MockGem {
@@ -19,6 +20,15 @@ contract MockGem {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     mapping(address => bool) public isBanned;
+    bool public paused;
+
+    error AccountBanned();
+    error EnforcedPause();
+
+    modifier notBanned(address usr) {
+        if (isBanned[usr]) revert AccountBanned();
+        _;
+    }
 
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
@@ -37,23 +47,38 @@ contract MockGem {
         isBanned[usr] = false;
     }
 
-    function approve(address spender, uint256 amt) external returns (bool) {
+    function pause() external {
+        paused = true;
+    }
+
+    function unpause() external {
+        paused = false;
+    }
+
+    function approve(address spender, uint256 amt) external notBanned(msg.sender) notBanned(spender) returns (bool) {
         allowance[msg.sender][spender] = amt;
         emit Approval(msg.sender, spender, amt);
         return true;
     }
 
-    function transfer(address to, uint256 amt) external returns (bool) {
+    function transfer(address to, uint256 amt) external notBanned(msg.sender) notBanned(to) returns (bool) {
         return _move(msg.sender, to, amt);
     }
 
-    function transferFrom(address from, address to, uint256 amt) external returns (bool) {
+    function transferFrom(address from, address to, uint256 amt)
+        external
+        notBanned(msg.sender)
+        notBanned(from)
+        notBanned(to)
+        returns (bool)
+    {
         uint256 allowed = allowance[from][msg.sender];
         if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amt;
         return _move(from, to, amt);
     }
 
     function _move(address from, address to, uint256 amt) internal returns (bool) {
+        if (paused) revert EnforcedPause();
         balanceOf[from] -= amt;
         balanceOf[to] += amt;
         emit Transfer(from, to, amt);

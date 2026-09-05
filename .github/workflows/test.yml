@@ -6,6 +6,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_checks:
+        description: Run required archive-backed mainnet fork and live smoke checks
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -14,13 +19,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           submodules: recursive
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.7.1
 
       - name: Show Forge version
         run: forge --version
@@ -33,3 +40,31 @@ jobs:
 
       - name: Run Forge tests
         run: forge test -vvv
+
+  release-fork:
+    name: Release mainnet checks
+    if: github.event_name == 'workflow_dispatch' && inputs.release_checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+      FORK_BLOCK: ${{ vars.WSGEM_FORK_BLOCK || '25589900' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.7.1
+      - name: Require the release RPC and a historical block
+        shell: bash
+        run: |
+          test -n "$ETH_RPC_URL" || { echo "Configure the ETH_RPC_URL repository secret"; exit 1; }
+          [[ "$FORK_BLOCK" =~ ^[1-9][0-9]*$ ]] || { echo "WSGEM_FORK_BLOCK must be a positive historical block"; exit 1; }
+          printf 'Release fork block: %s\n' "$FORK_BLOCK"
+      - name: Run deterministic mainnet fork checks
+        run: make test-fork
+      - name: Run latest mainnet smoke checks
+        run: make test-smoke

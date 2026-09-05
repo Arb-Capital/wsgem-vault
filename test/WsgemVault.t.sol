@@ -6,6 +6,7 @@ import {VaultTestBase} from "./VaultTestBase.sol";
 import {WsgemVault} from "../src/WsgemVault.sol";
 import {IWsgem} from "../src/interfaces/IWsgem.sol";
 import {IWsgemVault} from "../src/interfaces/IWsgemVault.sol";
+import {MockGem} from "./mocks/MockGem.sol";
 
 /// @dev A wsgem stand-in with the wrong decimals, for the constructor guard.
 contract SixDecimalWsgem {
@@ -236,6 +237,12 @@ contract WsgemVaultTest is VaultTestBase {
 
     function test_Constructor_OraclePaused_Reverts() public {
         pip.pause();
+        vm.expectRevert(_invalidPrice());
+        new WsgemVault("V", "V", address(wsgem));
+    }
+
+    function test_Constructor_FeedReverts_Reverts() public {
+        act.file("bpsout", 10_001); // burncost() underflows
         vm.expectRevert(_invalidPrice());
         new WsgemVault("V", "V", address(wsgem));
     }
@@ -476,10 +483,10 @@ contract WsgemVaultTest is VaultTestBase {
         vault.deposit(10e18, alice);
         _openMint();
 
-        // paused + banned vault -> NotAuthorized
+        // paused oracle + banned vault -> gem transfer rejects the spender first
         gem.ban(address(vault));
         vm.prank(alice);
-        vm.expectRevert(_notAuthorized(address(vault)));
+        vm.expectRevert(MockGem.AccountBanned.selector);
         vault.deposit(10e18, alice);
         gem.unban(address(vault));
 
@@ -527,16 +534,16 @@ contract WsgemVaultTest is VaultTestBase {
         vault.mint(WAD, alice);
         pip.poke(initNavprice);
 
-        // mint closed + banned -> MarketClosed
+        // mint closed + banned -> gem transfer rejects the spender before wsgem.mint
         gem.ban(address(vault));
         vm.prank(alice);
-        vm.expectRevert(_marketClosed());
+        vm.expectRevert(MockGem.AccountBanned.selector);
         vault.mint(WAD, alice);
         _openMint();
 
-        // banned + dust -> NotAuthorized
+        // banned + dust -> gem transfer rejects the spender first
         vm.prank(alice);
-        vm.expectRevert(_notAuthorized(address(vault)));
+        vm.expectRevert(MockGem.AccountBanned.selector);
         vault.mint(WAD - 1, alice);
         gem.unban(address(vault));
 
@@ -1162,7 +1169,7 @@ contract WsgemVaultTest is VaultTestBase {
         assertEq(gem.balanceOf(alice), a);
         assertEq(vault.balanceOf(alice), s - burned);
         uint256 released = burned * held / s;
-        assertGe(released, needed);
+        assertEq(released, needed, "withdraw releases exactly the wsgem it needs");
         assertEq(wsgem.balanceOf(address(vault)), held - released);
     }
 
@@ -1281,6 +1288,7 @@ contract WsgemVaultTest is VaultTestBase {
         vm.prank(alice);
         uint256 g = vault.redeem(s, alice, alice);
         assertEq(g, s * _bc() / WAD);
+        assertLe(g, a, "a lap never gains");
 
         // Direct lap with the same gem.
         uint256 w = _mintWsgem(carol, a);
@@ -2187,6 +2195,135 @@ contract WsgemVaultTest is VaultTestBase {
         assertEq(vault.convertToAssets(WAD), initNavprice);
     }
 
+    /// @dev A feed that reverts (rather than reporting 0) must not brick the oracle-free
+    /// legs: `_sync()` gives up without touching the fallback, `sync()` reverts
+    /// `InvalidPrice`, and the wsgem legs quote and execute 1:1. `s` is alice's whole position.
+    function _assertWsgemLegsLiveUnrefreshed(uint256 s) internal {
+        uint256 nav0 = vault.lastNav();
+        uint256 mu0 = vault.lastMintUnit();
+        uint256 bu0 = vault.lastBurnUnit();
+        vm.expectRevert(_invalidPrice());
+        vault.sync();
+        assertEq(vault.maxRedeemToWsgem(alice), s);
+        assertEq(vault.maxDepositWsgem(alice), type(uint256).max);
+        assertEq(vault.previewRedeemToWsgem(s), s);
+        assertEq(vault.previewDepositWsgem(s), s);
+        vm.prank(alice);
+        assertEq(vault.redeemToWsgem(s, alice, alice), s);
+        vm.startPrank(alice);
+        wsgem.approve(address(vault), s);
+        assertEq(vault.depositWsgem(s, alice), s);
+        vm.stopPrank();
+        assertEq(vault.balanceOf(alice), s);
+        assertEq(vault.lastNav(), nav0, "fallback touched");
+        assertEq(vault.lastMintUnit(), mu0, "fallback touched");
+        assertEq(vault.lastBurnUnit(), bu0, "fallback touched");
+    }
+
+    /// @dev `MaseerGate.file` is unbounded (unlike `setBpsout`), so governance can file a
+    /// bpsout above 10000 and `burncost()` then underflows. Gem-out and its quotes revert
+    /// with the wsgem's panic; gem-in never reads `burncost()` and is served.
+    function test_FeedReverts_Burncost_WsgemLegsLive() public {
+        uint256 s = _depositGem(alice, 100e18);
+        pip.poke(1.2e18); // a refresh would now move lastNav
+        act.file("bpsout", 10_001);
+        vm.expectRevert(stdError.arithmeticError);
+        wsgem.burncost();
+
+        _assertWsgemLegsLiveUnrefreshed(s);
+
+        vm.startPrank(alice);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.redeem(WAD, alice, alice);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.withdraw(WAD, alice, alice);
+        vm.stopPrank();
+        vm.expectRevert(stdError.arithmeticError);
+        vault.previewRedeem(WAD);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.maxRedeem(alice);
+        assertEq(_depositGem(bob, _mc()), WAD);
+        assertEq(vault.lastNav(), initNavprice);
+
+        act.setBpsout(25);
+        _depositGem(bob, _mc());
+        assertEq(vault.lastNav(), 1.2e18);
+        assertEq(vault.lastBurnUnit(), _bc());
+    }
+
+    /// @dev `file("bpsin", ...)` overflows `mintcost()` the same way: gem-in and its quotes
+    /// revert, gem-out is served.
+    function test_FeedReverts_Mintcost_WsgemLegsLive() public {
+        uint256 s = _depositGem(alice, 100e18);
+        pip.poke(1.2e18);
+        act.file("bpsin", type(uint256).max);
+        vm.expectRevert(stdError.arithmeticError);
+        wsgem.mintcost();
+
+        _assertWsgemLegsLiveUnrefreshed(s);
+
+        gem.mint(bob, 10e18);
+        vm.startPrank(bob);
+        gem.approve(address(vault), 10e18);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.deposit(2e18, bob);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.mint(WAD, bob);
+        vm.stopPrank();
+        vm.expectRevert(stdError.arithmeticError);
+        vault.previewDeposit(WAD);
+        vm.expectRevert(stdError.arithmeticError);
+        vault.maxDeposit(bob);
+        vm.prank(alice);
+        assertEq(vault.redeem(WAD, alice, alice), _bc());
+        assertEq(vault.lastNav(), initNavprice);
+
+        act.setBpsin(0);
+        vm.prank(alice);
+        vault.redeem(WAD, alice, alice);
+        assertEq(vault.lastNav(), 1.2e18);
+        assertEq(vault.lastMintUnit(), _mc());
+    }
+
+    /// @dev A price feed that reverts outright (a broken `pip` upgrade) takes every quote
+    /// and both gem legs down with it, and nothing else.
+    function test_FeedReverts_Navprice_WsgemLegsLive() public {
+        uint256 s = _depositGem(alice, 100e18);
+        pip.poke(1.2e18);
+        bytes memory pipDown = abi.encodeWithSignature("PipDown()");
+        vm.mockCallRevert(address(pip), abi.encodeWithSelector(pip.read.selector), pipDown);
+        vm.expectRevert(pipDown);
+        wsgem.navprice();
+
+        _assertWsgemLegsLiveUnrefreshed(s);
+
+        gem.mint(bob, 10e18);
+        vm.startPrank(bob);
+        gem.approve(address(vault), 10e18);
+        vm.expectRevert(pipDown);
+        vault.deposit(2e18, bob);
+        vm.expectRevert(pipDown);
+        vault.mint(WAD, bob);
+        vm.stopPrank();
+        vm.startPrank(alice);
+        vm.expectRevert(pipDown);
+        vault.redeem(WAD, alice, alice);
+        vm.expectRevert(pipDown);
+        vault.withdraw(WAD, alice, alice);
+        vm.stopPrank();
+        vm.expectRevert(pipDown);
+        vault.convertToAssets(WAD);
+        vm.expectRevert(pipDown);
+        vault.totalAssets();
+        vm.expectRevert(pipDown);
+        vault.oracleLive();
+
+        vm.clearMockedCalls();
+        vm.prank(alice);
+        vault.redeemToWsgem(1, alice, alice);
+        assertEq(vault.lastNav(), 1.2e18);
+    }
+
     function test_NavDownPoke_RepricesEverything() public {
         uint256 s = _depositGem(alice, 100e18);
         pip.poke(0.9e18);
@@ -2204,14 +2341,14 @@ contract WsgemVaultTest is VaultTestBase {
     //////////////////////////////////////////////////////////////*/
 
     function test_BannedVault_DepositGem_Reverts() public {
-        gem.ban(address(vault));
         gem.mint(alice, 100e18);
         vm.startPrank(alice);
         gem.approve(address(vault), 100e18);
+        gem.ban(address(vault));
         assertEq(vault.previewDeposit(100e18), 100e18 * WAD / _mc()); // quoted, not gated
-        vm.expectRevert(_notAuthorized(address(vault)));
+        vm.expectRevert(MockGem.AccountBanned.selector);
         vault.deposit(100e18, alice);
-        vm.expectRevert(_notAuthorized(address(vault)));
+        vm.expectRevert(MockGem.AccountBanned.selector);
         vault.mint(WAD, alice);
         vm.stopPrank();
     }
@@ -2292,10 +2429,14 @@ contract WsgemVaultTest is VaultTestBase {
         vault.depositWsgem(out, alice);
     }
 
-    function test_BannedUser_DepositGem_Unscreened() public {
+    function test_BannedUser_DepositGem_GemRejects() public {
+        gem.mint(alice, 100e18);
+        vm.prank(alice);
+        gem.approve(address(vault), 100e18);
         gem.ban(alice);
-        // The gem is not screened and the vault is the wsgem minter.
-        assertGt(_depositGem(alice, 100e18), 0);
+        vm.prank(alice);
+        vm.expectRevert(MockGem.AccountBanned.selector);
+        vault.deposit(100e18, alice);
     }
 
     function test_RedeemToWsgem_BannedReceiver_Reverts() public {
@@ -2307,12 +2448,14 @@ contract WsgemVaultTest is VaultTestBase {
         vault.redeemToWsgem(s, bob, alice);
     }
 
-    function test_Redeem_BannedReceiver_Unscreened() public {
+    function test_Redeem_BannedReceiver_GemRejects() public {
         uint256 s = _depositGem(alice, 100e18);
         gem.ban(bob);
         vm.prank(alice);
-        uint256 out = vault.redeem(s, bob, alice);
-        assertEq(gem.balanceOf(bob), out);
+        vm.expectRevert(MockGem.AccountBanned.selector);
+        vault.redeem(s, bob, alice);
+        assertEq(vault.balanceOf(alice), s);
+        assertEq(gem.balanceOf(bob), 0);
     }
 
     function test_BannedHolder_VaultSharesStillTransferable() public {
