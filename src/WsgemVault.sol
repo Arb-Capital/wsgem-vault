@@ -17,18 +17,20 @@ import {IGemPausable} from "./interfaces/IGemPausable.sol";
 /// share per wsgem, and reports the wsgem's gem as `asset()`; the share price is the wsgem's
 /// `navprice()` (gem native units per whole wsgem).
 /// @dev `deposit`/`mint` replicate `wsgem.mint()` at `mintcost()`; `redeem`/`withdraw`
-/// replicate `wsgem.redeem()` at `burncost()`. The wsgem legs are fee-free and 1:1 while
-/// fully backed. Fees affect previews and execution, but `totalAssets` and `convertTo*` are
-/// gross. Quotes use the values last observed live while `navprice()` is 0. `max*` return 0
-/// while a leg is unavailable. Gem redemption requires cooldown 0 and the full claim in gem.
-/// Backing is the held wsgem capped at the share supply; while `deficit()` is non-zero,
-/// deposits revert `Insolvent` and redemptions pay pro-rata.
+/// replicate `wsgem.redeem()` at `burncost()`. The wsgem legs are fee-free, 1:1 while
+/// fully backed, and never read the oracle. Fees affect previews and execution, but
+/// `totalAssets` and `convertTo*` are gross. Quotes use the values last observed live while
+/// `navprice()` is 0. `max*` return 0 while a leg is unavailable. Gem redemption requires
+/// cooldown 0 and the full claim in gem. Backing is the held wsgem capped at the share
+/// supply; while `deficit()` is non-zero, deposits revert `Insolvent` and redemptions pay
+/// pro-rata.
 contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
     uint256 internal constant WAD = 1e18;
-    uint256 internal constant READ_GAS_LIMIT = 50_000;
+    /// @dev Gas budget for one optional feed read; the live wstGBP feeds cost under 25k each.
+    uint256 internal constant READ_GAS_LIMIT = 100_000;
 
     /// @inheritdoc IWsgemVault
     address public immutable wsgem;
@@ -259,7 +261,6 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
 
     /// @inheritdoc IWsgemVault
     function depositWsgem(uint256 wsgemIn, address receiver) external returns (uint256 shares) {
-        _sync();
         if (wsgemIn != 0) {
             _requireSolvent();
             IERC20(wsgem).safeTransferFrom(msg.sender, address(this), wsgemIn);
@@ -271,7 +272,6 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
 
     /// @inheritdoc IWsgemVault
     function redeemToWsgem(uint256 shares, address receiver, address owner) external returns (uint256 wsgemOut) {
-        _sync();
         wsgemOut = _wsgemForShares(shares);
         if (shares != 0 && wsgemOut == 0) revert Insolvent(deficit());
         if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
@@ -302,8 +302,9 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
     }
 
     /// @dev Refreshes the fallback values from a live oracle; returns false, leaving them
-    /// untouched, while the oracle is paused or a feed fails, returns malformed data,
-    /// or exceeds its gas budget. The three values are committed together.
+    /// untouched, while the oracle is paused or any feed read fails, returns malformed data,
+    /// or exceeds its gas budget. The three values are committed together. Called by the
+    /// gem legs and `sync()` only.
     function _sync() internal returns (bool live) {
         (bool navOk, uint256 nav) = _tryReadWord(wsgem, IWsgem.navprice.selector);
         if (!navOk || nav == 0) return false;
@@ -320,8 +321,9 @@ contract WsgemVault is ERC20Permit, IERC4626, IWsgemVault {
         return true;
     }
 
-    /// @dev Fixed gas and output size: neither a gas-burning callee nor a return-data
-    /// bomb can make an optional refresh consume unbounded caller resources.
+    /// @dev Reads a no-argument getter as one ABI word within `READ_GAS_LIMIT`, copying
+    /// nothing else: a missing getter, a revert, an over-budget callee, or a return of any
+    /// other size reads as a failure.
     function _tryReadWord(address target, bytes4 selector) internal view returns (bool ok, uint256 value) {
         uint256 gasLimit = READ_GAS_LIMIT;
         assembly ("memory-safe") {

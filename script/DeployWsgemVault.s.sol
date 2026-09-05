@@ -191,7 +191,7 @@ contract DeployWsgemVault is Script {
 
     function _sanityFallback(WsgemVault vault, IWsgem w) internal view {
         // The oracle-pause fallback must have been seeded by the constructor; it refreshes
-        // on every state-changing call and on sync(), so it may lag on a quiet vault.
+        // on every gem-leg call and on sync(), so it may lag on a quiet vault.
         require(vault.lastNav() > 0 && vault.lastMintUnit() > 0, "fallback unseeded");
         if (vault.lastNav() != w.navprice()) {
             console.log("WARN: oracle-pause fallback lags the live NAV; call sync() to refresh");

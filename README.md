@@ -105,8 +105,8 @@ All market parameters are governable per instance.
 
 - **Nothing on the quoting side reverts during a NAV pause.** While `navprice()` is 0,
   `totalAssets`, `convertTo*` and the previews use the NAV and fee units last observed from
-  a live oracle (`lastNav`, `lastMintUnit`, `lastBurnUnit`, refreshed on every
-  state-changing call and by the permissionless `sync()`), so integrators keep a price
+  a live oracle (`lastNav`, `lastMintUnit`, `lastBurnUnit`, refreshed by every gem-leg
+  call and by the permissionless `sync()`), so integrators keep a price
   rather than a revert or a zero. `max*` report 0 for the gem legs (the wsgem's own
   mint/redeem are frozen) and execution of those legs reverts `InvalidPrice`; the wsgem
   legs stay live. Accepted: a pause does **not** make that fallback a safe price — it is
@@ -115,10 +115,12 @@ All market parameters are governable per instance.
   price on it check `oracleLive()` and fail closed themselves (the Pendle SY does); keepers
   should `sync()` in the same transaction as every NAV update so the fallback never lags.
   A feed that **reverts** rather than reporting 0 is a different case: quotes, `max*`,
-  and gem-leg execution that require that feed revert with it. The optional refresh limits
-  each call to 50,000 gas and copies only one ABI word; a failed, malformed, or over-budget
-  read leaves the whole cached tuple untouched. The wsgem legs stay live. `oracleLive()`
-  only means nonzero NAV, so integrations must also track the underlying NAV update age.
+  and gem-leg execution that require that feed revert with it. The refresh reads each feed
+  with a 100,000-gas budget and copies one ABI word, so a failed, malformed, oversized, or
+  over-budget read leaves the whole cached tuple untouched and the gem leg that does not
+  need that feed stays usable. The wsgem legs never read the feeds, so they stay live
+  whatever a feed does. `oracleLive()` only means nonzero NAV, so integrations must also
+  track the underlying NAV update age.
 - **`convertToAssets` overvalues shares by `bpsout` relative to a gem exit.** Anything that
   prices shares off `convertToAssets` (PT oracles, LTVs) is 25 bps above what a gem
   redemption pays right now; at that size it is absorbed by any sane LTV or liquidation
@@ -159,7 +161,7 @@ All market parameters are governable per instance.
 - **Gem availability is explicit.** `gemTransfersAvailable()` checks the vault and wsgem
   compliance status and the gem's pause state when detected. `gemPausable()` records whether
   a valid `paused()` getter was present at construction. For a detected pausable gem,
-  a failing or malformed pause getter makes gem maxima zero. A tGBP pause or ban on wstGBP
+  a failing, malformed, oversized, or over-budget pause getter makes gem maxima zero. A tGBP pause or ban on wstGBP
   also makes all gem maxima zero and fails the deployment health check, while wsgem exits
   remain available if their transfer participants pass compliance. The pinned tGBP script
   requires pause-interface detection to succeed.
@@ -180,7 +182,7 @@ All market parameters are governable per instance.
 - **No admin surface at all.** The vault's only trust assumptions are the wsgem's
   (permissioned NAV, privileged smelt, upgradeable gate/oracle/guard feeds). A feed that
   reverts takes the quotes and gem legs that read it down with it until wsgem governance
-  repairs it; the wsgem legs tolerate a failed bounded refresh and stay live. The gem's own
+  repairs it; the wsgem legs never read the feeds and stay live. The gem's own
   issuer, pause, compliance, and upgrade controls also remain upstream trust dependencies.
 - **Token compatibility assumptions**: the wsgem must follow the Maseer wsgem interface,
   use 18 decimals (enforced at construction), and transfer exact requested amounts. The gem

@@ -21,6 +21,51 @@ contract SixDecimalWsgem {
     }
 }
 
+/// @dev A gate whose one chosen fee getter burns all gas; every other getter is healthy.
+contract GasBurningGate {
+    bytes4 internal immutable burning;
+
+    constructor(bytes4 burning_) {
+        burning = burning_;
+    }
+
+    function mintable() external pure returns (bool) {
+        return true;
+    }
+
+    function burnable() external pure returns (bool) {
+        return true;
+    }
+
+    function cooldown() external pure returns (uint256) {
+        return 0;
+    }
+
+    function capacity() external pure returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function terms() external pure returns (string memory) {
+        return "";
+    }
+
+    function mintcost(uint256 price) external view returns (uint256) {
+        _burnIf(this.mintcost.selector);
+        return price;
+    }
+
+    function burncost(uint256 price) external view returns (uint256) {
+        _burnIf(this.burncost.selector);
+        return (price * 9975 + 9999) / 10_000;
+    }
+
+    function _burnIf(bytes4 selector) internal view {
+        if (selector == burning) {
+            while (true) {}
+        }
+    }
+}
+
 contract WsgemVaultTest is VaultTestBase {
     event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
     event Withdraw(
@@ -284,11 +329,19 @@ contract WsgemVaultTest is VaultTestBase {
         uint256 s = _depositGem(alice, 100e18);
         pip.poke(1.1e18);
         assertEq(vault.lastNav(), initNavprice);
-        vm.prank(alice);
-        vault.redeemToWsgem(s / 2, alice, alice); // oracle-free leg still refreshes
+        // The wsgem legs never read the oracle, so they never refresh.
+        vm.startPrank(alice);
+        vault.redeemToWsgem(s / 2, alice, alice);
+        wsgem.approve(address(vault), s / 2);
+        vault.depositWsgem(s / 2, alice);
+        vm.stopPrank();
+        assertEq(vault.lastNav(), initNavprice);
+        // Every gem leg does.
+        _depositGem(bob, 10e18);
         assertEq(vault.lastNav(), 1.1e18);
         pip.poke(1.3e18);
-        _depositGem(bob, 10e18);
+        vm.prank(alice);
+        vault.redeem(WAD, alice, alice);
         assertEq(vault.lastNav(), 1.3e18);
         assertEq(vault.lastMintUnit(), _mc());
         assertEq(vault.lastBurnUnit(), _bc());
@@ -2319,9 +2372,99 @@ contract WsgemVaultTest is VaultTestBase {
         vault.oracleLive();
 
         vm.clearMockedCalls();
-        vm.prank(alice);
-        vault.redeemToWsgem(1, alice, alice);
+        _depositGem(bob, _mc());
         assertEq(vault.lastNav(), 1.2e18);
+    }
+
+    /// @dev The refresh reads each feed within a fixed gas budget, so a fee getter that burns
+    /// all gas only takes down the gem leg that needs it, exactly as it does on the wsgem's
+    /// own path, and the fallback tuple is left untouched.
+    function test_FeedBurnsGas_Mintcost_GemOutStillServed() public {
+        uint256 s = _depositGem(alice, 100e18);
+        uint256 w = _mintWsgem(bob, 10e18);
+        pip.poke(1.2e18); // a refresh would now move lastNav
+        vm.etch(address(act), address(new GasBurningGate(act.mintcost.selector)).code);
+
+        // The wsgem's own redemption reads only burncost and is served at an ordinary budget.
+        vm.prank(bob);
+        (bool direct,) = address(wsgem).call{gas: 300_000}(abi.encodeCall(wsgem.redeem, (w)));
+        assertTrue(direct, "direct redeem");
+        // So is the vault's.
+        uint256 before = gem.balanceOf(alice);
+        vm.prank(alice);
+        (bool ok, bytes memory ret) =
+            address(vault).call{gas: 400_000}(abi.encodeCall(vault.redeem, (WAD, alice, alice)));
+        assertTrue(ok, "vault redeem");
+        assertEq(abi.decode(ret, (uint256)), gem.balanceOf(alice) - before);
+        assertEq(vault.lastNav(), initNavprice, "fallback touched");
+        assertEq(vault.lastMintUnit(), _mintcostOf(initNavprice, 0), "fallback touched");
+        assertEq(vault.lastBurnUnit(), _burncostOf(initNavprice, 25), "fallback touched");
+
+        // Gem-in needs mintcost and fails with the wsgem.
+        gem.mint(bob, 10e18);
+        vm.startPrank(bob);
+        gem.approve(address(vault), 10e18);
+        (bool depOk,) = address(vault).call{gas: 400_000}(abi.encodeCall(vault.deposit, (2e18, bob)));
+        vm.stopPrank();
+        assertFalse(depOk, "gem-in served without mintcost");
+
+        _assertWsgemLegsLiveUnrefreshed(s - WAD);
+    }
+
+    function test_FeedBurnsGas_Burncost_GemInStillServed() public {
+        uint256 s = _depositGem(alice, 100e18);
+        pip.poke(1.2e18);
+        vm.etch(address(act), address(new GasBurningGate(act.burncost.selector)).code);
+
+        uint256 amt = _mc();
+        gem.mint(bob, amt);
+        vm.startPrank(bob);
+        gem.approve(address(vault), amt);
+        (bool ok, bytes memory ret) = address(vault).call{gas: 400_000}(abi.encodeCall(vault.deposit, (amt, bob)));
+        vm.stopPrank();
+        assertTrue(ok, "vault deposit");
+        assertEq(abi.decode(ret, (uint256)), WAD);
+        assertEq(vault.lastNav(), initNavprice, "fallback touched");
+
+        vm.prank(alice);
+        (bool redOk,) = address(vault).call{gas: 400_000}(abi.encodeCall(vault.redeem, (WAD, alice, alice)));
+        assertFalse(redOk, "gem-out served without burncost");
+
+        _assertWsgemLegsLiveUnrefreshed(s);
+    }
+
+    /// @dev An oversized feed response is never copied: the refresh fails closed and the gem
+    /// leg that does not need that feed is served.
+    function test_FeedReturnsOversized_Mintcost_GemOutStillServed() public {
+        uint256 s = _depositGem(alice, 100e18);
+        pip.poke(1.2e18);
+        vm.mockCall(address(wsgem), abi.encodeWithSelector(IWsgem.mintcost.selector), new bytes(65_536));
+        vm.prank(alice);
+        (bool ok,) = address(vault).call{gas: 400_000}(abi.encodeCall(vault.redeem, (WAD, alice, alice)));
+        assertTrue(ok, "vault redeem");
+        assertEq(vault.lastNav(), initNavprice, "fallback touched");
+        _assertWsgemLegsLiveUnrefreshed(s - WAD);
+        vm.clearMockedCalls();
+    }
+
+    /// @dev An oversized `paused()` response is never copied either: gem maxima report 0
+    /// without reverting, and the wsgem leg is unaffected.
+    function test_OversizedPauseResponse_MaxZeroWithoutRevert() public {
+        uint256 s = _depositGem(alice, 100e18);
+        vm.mockCall(address(gem), abi.encodeWithSelector(gem.paused.selector), new bytes(512 * 1024));
+        bytes4[4] memory maxes =
+            [vault.maxDeposit.selector, vault.maxMint.selector, vault.maxWithdraw.selector, vault.maxRedeem.selector];
+        for (uint256 i = 0; i < maxes.length; i++) {
+            (bool ok, bytes memory ret) =
+                address(vault).staticcall{gas: 500_000}(abi.encodeWithSelector(maxes[i], alice));
+            assertTrue(ok, "max* reverted");
+            assertEq(abi.decode(ret, (uint256)), 0, "max* not zero");
+        }
+        assertFalse(vault.gemTransfersAvailable());
+        assertEq(vault.maxRedeemToWsgem(alice), s);
+        vm.clearMockedCalls();
+        assertTrue(vault.gemTransfersAvailable());
+        assertEq(vault.maxRedeem(alice), s);
     }
 
     function test_NavDownPoke_RepricesEverything() public {

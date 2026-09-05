@@ -53,8 +53,9 @@ interface IWsgemVault {
     /// @notice `burncost()` last observed live; used by quotes while the oracle is paused.
     function lastBurnUnit() external view returns (uint256);
     /// @notice Refreshes the fallback values from the live oracle; reverts `InvalidPrice`
-    /// while paused or while a feed reverts. Every state-changing call also refreshes them
-    /// when it can; failed, malformed, or over-budget reads leave the cached tuple untouched.
+    /// while paused or while a feed reverts. The gem legs also refresh them when they can;
+    /// a failed, malformed, or over-budget read leaves the tuple untouched. The wsgem legs
+    /// never read the feeds.
     function sync() external;
     /// @notice True while quotes read the live oracle rather than the fallback values.
     /// Fallback freshness is not guaranteed; integrations requiring live pricing should
