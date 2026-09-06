@@ -222,6 +222,7 @@ make test        # offline dev loop: unit + fuzz + ERC-4626 property + invariant
 make test-fork   # deterministic fork suite (pinned block; archive-capable RPC)
 make test-smoke  # latest-block live-parameter smoke checks (incl. gem-out liquidity)
 make test-all    # everything the configured RPC allows
+make invariant   # long invariant campaigns: RUNS=... DEPTH=... SEED=... [MATCH=<contract>]
 make coverage    # summary coverage of the src/ surface
 make gen-report  # HTML coverage report -> docs/coverage-report/ (view via make serve-report)
 ```
@@ -254,6 +255,9 @@ make deploy                # keystore-signed broadcast + inline Etherscan verify
 make check VAULT=0x...     # re-run the sanity battery against the mined vault (keyless)
 make verify VAULT=0x...    # verify an explicit mined address, without a signing wallet
 ```
+
+Both deploy targets run `forge clean` first, so the artifact is compiled from the current
+sources with the pinned settings rather than a stale cache.
 
 `make verify` uses `forge verify-contract`, extracts constructor arguments from on-chain
 creation code, and waits for explorer verification. It requires `VAULT` and

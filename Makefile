@@ -62,7 +62,7 @@ PUBLIC_RPC := https://ethereum-rpc.publicnode.com
 # the first-party audited surface (src/).
 COVERAGE_EXCLUDE := (test/|script/)
 
-.PHONY: build test test-fork test-smoke test-all fmt clean coverage gen-report serve-report \
+.PHONY: build test test-fork test-smoke test-all invariant fmt clean coverage gen-report serve-report \
 	deploy deploy-dry verify check
 
 build :; forge build
@@ -82,6 +82,17 @@ test-smoke :; REQUIRE_FORK=true forge test -vvv --match-contract 'SmokeTest$$'
 
 # Everything the configured RPC allows; offline it degrades to `make test` (fork/smoke skip).
 test-all :; forge test -vvv
+
+# Long invariant campaigns, offline like `make test`. RUNS and DEPTH override the [invariant]
+# section of foundry.toml (128 x 64) through forge's env overrides; SEED pins the fuzz seed
+# for a reproducible run; MATCH narrows the contract filter (default: every *InvariantTest).
+# fail_on_revert is off, so read the test_HandlerWiring_* output to confirm the ops executed.
+# Usage: make invariant RUNS=2000 DEPTH=256 SEED=1 [MATCH=WsgemVaultDrainInvariantTest]
+MATCH ?= InvariantTest$$
+invariant :
+	@echo "invariant campaign: runs=$(or $(RUNS),foundry.toml) depth=$(or $(DEPTH),foundry.toml) seed=$(or $(SEED),random) match='$(MATCH)'"
+	@$(OFFLINE) $(if $(RUNS),FOUNDRY_INVARIANT_RUNS=$(RUNS)) $(if $(DEPTH),FOUNDRY_INVARIANT_DEPTH=$(DEPTH)) \
+		forge test --match-contract '$(MATCH)' $(if $(SEED),--fuzz-seed $(SEED)) -vv
 
 fmt :; forge fmt
 
@@ -105,19 +116,25 @@ serve-report :; python3 -m http.server 8000 --directory docs/coverage-report
 # wstGBP script; see SCRIPT above for any other instance. Falls back to the public RPC when
 # ETH_RPC_URL is unset. Pass SENDER=0x... (the deployer address; no key needed to simulate
 # from it) so the predicted address and nonce are the real ones rather than forge's default.
-deploy-dry :; @$(KEYLESS) forge script $(SCRIPT) --rpc-url $(or $(ETH_RPC_URL),$(PUBLIC_RPC)) $(if $(SENDER),--sender $(SENDER)) -vvv
+# Starts from `forge clean` so the artifact is compiled from the current sources with the
+# pinned settings, never from a stale cache.
+deploy-dry :
+	@forge clean
+	@$(KEYLESS) forge script $(SCRIPT) --rpc-url $(or $(ETH_RPC_URL),$(PUBLIC_RPC)) $(if $(SENDER),--sender $(SENDER)) -vvv
 
 # Mainnet deploy: deploys the vault, runs the sanity battery, and verifies on Etherscan
 # inline. Signs from an encrypted keystore (`--keystore` + `--sender`) — forge prompts for
 # the keystore password; no raw private key on the command line or in the environment.
 # Requires: ETH_RPC_URL, ETH_FROM (deployer address), ETH_KEYSTORE (keystore JSON path),
 # ETHERSCAN_API_KEY. Optional: ETH_PRIO_FEE → --priority-gas-price and ETH_GAS_PRICE →
-# --with-gas-price; when unset, forge auto-estimates. Run `make deploy-dry` first.
+# --with-gas-price; when unset, forge auto-estimates. Run `make deploy-dry` first. Like the
+# dry run, starts from `forge clean` so what is broadcast is compiled fresh from source.
 deploy :
 	@test -n "$(ETH_RPC_URL)" || { echo "ETH_RPC_URL is required"; exit 1; }
 	@test -n "$(ETH_FROM)" || { echo "ETH_FROM (deployer address) is required"; exit 1; }
 	@test -n "$(ETH_KEYSTORE)" || { echo "ETH_KEYSTORE (keystore JSON path) is required"; exit 1; }
 	@test -n "$(ETHERSCAN_API_KEY)" || { echo "ETHERSCAN_API_KEY is required for --verify"; exit 1; }
+	forge clean
 	forge script $(SCRIPT) --rpc-url $(ETH_RPC_URL) \
 		--sender $(ETH_FROM) --keystore $(ETH_KEYSTORE) \
 		$(if $(ETH_PRIO_FEE),--priority-gas-price $(ETH_PRIO_FEE)) \
