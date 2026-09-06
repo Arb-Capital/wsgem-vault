@@ -98,9 +98,19 @@ implementation where every function is visibly a replica of the wsgem's own math
 
 | Instance | wsgem | gem | Current params | Vault |
 |---|---|---|---|---|
-| wstGBP | `0x57C3571f10767E49C9d7b60feb6c67804783B7aE` | tGBP `0x27f6c8289550fCE67f6B50BeD1F519966aFE5287` | `bpsin` 0, `bpsout` 25, `cooldown` 0, capacity unlimited, NAV poked ~weekly | not yet deployed |
+| wstGBP | `0x57C3571f10767E49C9d7b60feb6c67804783B7aE` | tGBP `0x27f6c8289550fCE67f6B50BeD1F519966aFE5287` | `bpsin` 0, `bpsout` 25, `cooldown` 0, capacity unlimited, NAV poked ~weekly | `0x955bD72bf23d93629e50BD311df197A061D8678E` |
 
 All market parameters are governable per instance.
+
+#### wstGBP deployment record
+
+| | |
+|---|---|
+| Vault | `0x955bD72bf23d93629e50BD311df197A061D8678E` ("Wren Staked tGBP Vault", `vwstGBP`) |
+| Deployed | 2026-09-06, block 25920254, tx `0xaf816687c0a738814e3b2caaa04cdc14ca34d3a93b0b3e5055d499fdd536d2f7` |
+| Deployer | `0xdeed2376ad1d9cc54e0cca449b1d7a96939120f9` (no ongoing role: the vault has no admin surface) |
+| Source | commit `047a446`, `script/DeployWstGbpVault.s.sol` via `make deploy`; broadcast record in `broadcast/DeployWstGbpVault.s.sol/1/run-latest.json` |
+| Post-flight | `make check VAULT=0x955bD72bf23d93629e50BD311df197A061D8678E` green against latest mainnet state on 2026-09-06 (bindings, metadata, `deficit() == 0`, live oracle) |
 
 ### Upstream authorities (wstGBP / tGBP)
 
