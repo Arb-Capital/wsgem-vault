@@ -157,6 +157,21 @@ contract WsgemVaultAuditTest is VaultTestBase {
         deployer.check(address(vault), address(wsgem), address(gem), alice);
     }
 
+    /// @dev The direct deploy entry point is as pinned as run(): metadata is refused before
+    /// any external read, so this holds offline with no code at the pinned addresses.
+    function test_Audit_PinnedDeploymentRejectsWrongMetadataOnDirectPath() public {
+        DeployWstGbpVault deployer = new DeployWstGbpVault();
+        address wstgbp = deployer.WSTGBP();
+        address tgbp = deployer.TGBP();
+        string memory name = deployer.VAULT_NAME();
+        string memory symbol = deployer.VAULT_SYMBOL();
+        vm.chainId(1);
+        vm.expectRevert("wrong pinned metadata");
+        deployer.deploy(wstgbp, "Wrong name", symbol, tgbp);
+        vm.expectRevert("wrong pinned metadata");
+        deployer.deploy(wstgbp, name, "WRONG", tgbp);
+    }
+
     function test_Audit_OracleLiveDoesNotDetectStaleNonzeroNav() public {
         uint256 before = vault.convertToAssets(WAD);
         vm.warp(block.timestamp + 365 days);

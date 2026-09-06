@@ -2,6 +2,10 @@ name: CI
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 on:
   push:
   pull_request:
@@ -16,6 +20,7 @@ jobs:
   check:
     name: Foundry project
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -45,6 +50,7 @@ jobs:
     name: Release mainnet checks
     if: github.event_name == 'workflow_dispatch' && inputs.release_checks
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     env:

@@ -78,6 +78,11 @@ contract DeployWsgemVaultTest is VaultTestBase {
         deployer.deploy(address(wsgem), "Wrapped Staked Gem Vault", "", address(gem));
     }
 
+    function test_Deploy_RequiresWsgem() public {
+        vm.expectRevert("WSGEM required");
+        deployer.deploy(address(0), "Wrapped Staked Gem Vault", "vwsGEM", address(gem));
+    }
+
     function test_Deploy_RequiresExpectedGem() public {
         vm.expectRevert("EXPECTED_GEM required");
         deployer.deploy(address(wsgem), "Wrapped Staked Gem Vault", "vwsGEM", address(0));
@@ -91,6 +96,14 @@ contract DeployWsgemVaultTest is VaultTestBase {
     function test_Deploy_OraclePausedAborts() public {
         pip.pause();
         vm.expectRevert("oracle paused");
+        _deploy();
+    }
+
+    function test_Deploy_GemPausedAborts() public {
+        // Construction succeeds (approval is not pause-gated), so the post-deploy battery is
+        // what refuses; under --broadcast that failure aborts the simulation before any send.
+        gem.pause();
+        vm.expectRevert("gem transfers unavailable");
         _deploy();
     }
 

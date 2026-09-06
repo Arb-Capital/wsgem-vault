@@ -92,3 +92,22 @@ the public RPC; the archive-backed release baseline must be recorded using the r
 No production vault address was supplied, so actual explorer verification, deployed-runtime
 comparison, post-deployment checks, and funding were not performed. The verification recipe
 was inspected through a dry run; no explorer write or blockchain transaction was submitted.
+
+## Post-review changes (addendum, 2026-09-05)
+
+Recorded after the review above, which is left unchanged as the historical record.
+
+- `efe5821`: `READ_GAS_LIMIT` raised from 50,000 to 100,000 (`src/WsgemVault.sol`); the
+  "50,000 gas" above describes the reviewed tree, not the shipped code. The same commit removed
+  the optional refresh from `depositWsgem` and `redeemToWsgem` entirely: the wsgem legs no
+  longer read any feed, and `_sync()` is called only by the gem legs and `sync()`.
+- `f689003`: added the solvency invariant suite (`test/WsgemVault.solvency.invariant.t.sol`;
+  rounding-ledger and backing-drain campaigns at 18 and 6 gem decimals, 20 executed tests).
+  The offline count is now 375 passed / 16 network-dependent skipped; the 351 above predates it.
+- Re-run on 2026-09-05 at `f689003`: fork and smoke suites 16 passed, 0 failed, 0 skipped at
+  latest block 25,915,426 over the public RPC; `make deploy-dry` green with no availability
+  warnings (5,430,482 gas estimated). The archive-backed pinned-block baseline was not re-run.
+- OpenZeppelin stays pinned at v4.9.3. Across the vault's direct and transitive imports,
+  the diff to v4.9.6 adds `_contextSuffixLength()` to `Context`, inherited through `ERC20`;
+  this hook is unused by the vault. The remaining changes in those imported files are
+  documentation only. The vault does not import `ERC2771Context`, `Multicall`, or `Base64`.

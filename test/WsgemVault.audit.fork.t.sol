@@ -15,8 +15,12 @@ interface AuditGem {
 }
 
 /// @notice Mainnet-fork-only fault injection; never broadcasts transactions.
-/// Regression tests for the audit fixes on the real underlying contracts.
+/// Regression tests for the audit fixes on the real underlying contracts. Pinned to the
+/// same block as the other fork suites so `make test-fork` is one recorded state; the
+/// release job overrides all three through FORK_BLOCK.
 contract WsgemVaultAuditForkTest is ForkBase {
+    uint256 constant PINNED_BLOCK = 25_589_900;
+
     address internal constant WSGEM = 0x57C3571f10767E49C9d7b60feb6c67804783B7aE;
     address internal constant GEM = 0x27f6c8289550fCE67f6B50BeD1F519966aFE5287;
     address internal alice = makeAddr("audit-alice");
@@ -24,7 +28,7 @@ contract WsgemVaultAuditForkTest is ForkBase {
     uint256 internal shares;
 
     function setUp() public {
-        if (!_forkOrSkip(vm.envOr("FORK_BLOCK", uint256(0)))) return;
+        if (!_forkOrSkip(vm.envOr("FORK_BLOCK", uint256(PINNED_BLOCK)))) return;
         vault = new WsgemVault("Wren Staked tGBP Vault", "vwstGBP", WSGEM);
         deal(GEM, alice, 200e18);
         vm.startPrank(alice);

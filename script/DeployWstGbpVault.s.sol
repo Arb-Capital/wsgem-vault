@@ -10,7 +10,8 @@ import {WsgemVault} from "../src/WsgemVault.sol";
 /// the configuration is fixed here. The vault has no owner, so there is nothing to hand over.
 ///
 /// WSGEM / EXPECTED_GEM / VAULT_NAME / VAULT_SYMBOL are pinned, not read: a value exported
-/// for another instance is refused rather than silently ignored. Use the generic
+/// for another instance is refused rather than silently ignored, and the direct
+/// `deploy(...)` entry point refuses any other pair or metadata. Use the generic
 /// {DeployWsgemVault} for any other wsgem.
 ///
 /// Usage:
@@ -53,6 +54,16 @@ contract DeployWstGbpVault is DeployWsgemVault {
         return (VAULT_NAME, VAULT_SYMBOL);
     }
 
+    function _validateNaming(string memory name, string memory symbol) internal view override {
+        require(block.chainid == 1, "Ethereum mainnet required");
+        require(
+            keccak256(bytes(name)) == keccak256(bytes(VAULT_NAME))
+                && keccak256(bytes(symbol)) == keccak256(bytes(VAULT_SYMBOL)),
+            "wrong pinned metadata"
+        );
+        super._validateNaming(name, symbol);
+    }
+
     function _validateTarget(address wsgem, address expectedGem) internal view override {
         require(block.chainid == 1, "Ethereum mainnet required");
         require(wsgem == WSTGBP && expectedGem == TGBP, "wrong pinned instance");
@@ -60,6 +71,8 @@ contract DeployWstGbpVault is DeployWsgemVault {
     }
 
     function _sanity(WsgemVault vault, address wsgem, address holder) internal view override {
+        require(keccak256(bytes(vault.name())) == keccak256(bytes(VAULT_NAME)), "vault name");
+        require(keccak256(bytes(vault.symbol())) == keccak256(bytes(VAULT_SYMBOL)), "vault symbol");
         require(vault.gemPausable(), "tGBP pause interface missing");
         super._sanity(vault, wsgem, holder);
     }

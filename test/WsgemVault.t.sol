@@ -1861,6 +1861,21 @@ contract WsgemVaultTest is VaultTestBase {
         assertGt(_depositGem(alice, 1e30), 0);
     }
 
+    /// @dev The README's warning that the `type(uint256).max` limit does not survive a quote.
+    function test_Quote_UnlimitedSentinel_Overflows() public {
+        uint256 max = type(uint256).max;
+        pip.poke(1e27); // unit above one gem: the assets side overflows
+        vm.expectRevert();
+        vault.previewMint(max);
+        vm.expectRevert();
+        vault.convertToAssets(max);
+        pip.poke(0.5e18); // unit below one gem: the shares side overflows
+        vm.expectRevert();
+        vault.previewDeposit(max);
+        vm.expectRevert();
+        vault.convertToShares(max);
+    }
+
     function test_MaxMint_CapacityBelowSupply_IsZero() public {
         _depositGem(alice, 100e18);
         act.setCapacity(wsgem.totalSupply() - 1);

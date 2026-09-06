@@ -33,8 +33,7 @@ wsgem ◄─redeemToWsgem       (1:1, fee-free)───────────
 - **Gem in** (`deposit`, `mint`) replicates `wsgem.mint()` share for share; **gem out**
   (`redeem`, `withdraw`) replicates `wsgem.redeem()` gem for gem.
 - **wsgem legs** (`depositWsgem`, `redeemToWsgem`, with their `preview*` / `max*`) are 1:1,
-  fee-free, and priced without the oracle. They attempt a bounded cache refresh; a failed
-  refresh does not block execution. Their errors and events live in `IWsgemVault`.
+  fee-free, and never read the feeds. Their errors and events live in `IWsgemVault`.
 - The stack is agnostic to gem decimals (they live inside the oracle price scaling).
 
 ## Pricing principles
@@ -71,8 +70,10 @@ for gem-out), else the largest amount that succeeds — `deposit(maxDeposit)`,
 `mint(maxMint)`, `withdraw(maxWithdraw)` and `redeem(maxRedeem)` always succeed, and one
 unit more always reverts. The one exception is unlimited wsgem capacity, where
 `maxDeposit`/`maxMint` saturate to `type(uint256).max` (EIP-4626's "no limit" value) rather
-than to a depositable amount. Execution enforces every gate on live values, with the wsgem's
-own selectors (`MarketClosed`, `InvalidPrice`, `DustThreshold`, `ExceedsCap`,
+than to a depositable amount. A wsgem getter that reverts takes every `max*` that reads it
+down with it rather than reporting 0: a deliberate deviation from EIP-4626's rule that `max*`
+never revert (see the behavior notes). Execution enforces every gate on live values, with the
+wsgem's own selectors (`MarketClosed`, `InvalidPrice`, `DustThreshold`, `ExceedsCap`,
 `NotAuthorized`) plus the vault's `Insolvent`, `CooldownActive` and
 `InsufficientLiquidity`. The vendored a16z ERC-4626 property suite passes with zero
 tolerance (`_delta_ = 0`), with and without an entry fee, at 18 and 6 gem decimals.
@@ -100,6 +101,21 @@ implementation where every function is visibly a replica of the wsgem's own math
 | wstGBP | `0x57C3571f10767E49C9d7b60feb6c67804783B7aE` | tGBP `0x27f6c8289550fCE67f6B50BeD1F519966aFE5287` | `bpsin` 0, `bpsout` 25, `cooldown` 0, capacity unlimited, NAV poked ~weekly | not yet deployed |
 
 All market parameters are governable per instance.
+
+### Upstream authorities (wstGBP / tGBP)
+
+Observed by the [production-readiness audit](audits/2026-09-05-production-readiness.md) on
+2026-09-05. Re-read each before deploying and record the acceptance in the release checklist.
+The vault has no counterpart to any of them: misuse or compromise upstream can have total-loss
+impact without exploiting the vault (audit R-01).
+
+| Authority | Address | Controls |
+|---|---|---|
+| wstGBP governance Safe (threshold 3 of 5 owners as observed) | `0xa73c94969dE90Edb159D29922C42fF24beDFA085` | `wards` on the price, gate, treasury, and compliance proxies; oracle updater (`bud`); issuer (`smelt`) |
+| wstGBP oracle / gate / treasury / compliance | `0x6A79dCe61A12aa4b75449e0B03746260765D07dF` / `0xB59cB4d3075a8ce5013C78e8Bd7aDA3Fd1300f7f` / `0xa8F5bE8457D6ed5c659647fa8d107C3F2086626A` / `0x794cF5948444b14105587455EbE96Caace036d52` | NAV, fees, windows, cooldown, capacity, liquidity, deny list |
+| tGBP owner (EOA, no code) | `0xAF4fCE2984Fb307a368f3Ff01f900909956595C0` | pause, ban, mint, UUPS upgrade |
+| tGBP proxy admin (its owner is the tGBP owner) | `0x666b8f67969a22a4015d6d523d8671ee714b114f` | transparent-proxy upgrade |
+| tGBP implementation (at audit) | `0x94321D80d3C5cdaC63B75F723AE64Ca7F94bE547` | ERC-1967 target |
 
 ## Behavior notes for integrators
 
@@ -133,6 +149,9 @@ All market parameters are governable per instance.
   quote them, and `maxRedeem`/`maxWithdraw` return 0 below the floor. The wsgem legs have
   no minimum. `mint(shares)` for less than roughly one whole share reverts `DustThreshold`
   denominated in gem, because that is the wsgem's error for the implied deposit.
+- **`previewWithdraw` has a sentinel.** It returns `type(uint256).max` while the exit unit is 0
+  or nothing backs the shares, since no share count reaches the requested gem; `withdraw`
+  reverts `InvalidPrice` or `Insolvent` in those states and `maxWithdraw` is 0.
 - **`maxDeposit`/`maxMint` saturate to `type(uint256).max` under unlimited capacity** (the
   live wstGBP configuration), and that value does not survive a quote: `previewMint` and
   `convertToAssets` of it overflow and revert once the share price exceeds one gem
@@ -230,6 +249,7 @@ RPC configuration and requires a positive historical block.
 
 ```shell
 make deploy-dry            # keyless simulation against live mainnet state — run first
+                           #   (SENDER=0x... simulates from the real deployer)
 make deploy                # keystore-signed broadcast + inline Etherscan verify
 make check VAULT=0x...     # re-run the sanity battery against the mined vault (keyless)
 make verify VAULT=0x...    # verify an explicit mined address, without a signing wallet
@@ -269,12 +289,44 @@ the same battery against the mined instance — or any time later as a health ch
 env-supplied configuration rather than trusting the vault under check (otherwise any healthy
 vault would pass, including one bound to the wrong wsgem).
 
+### Release checklist
+
+Record the evidence for each step with the deployment (commit, blocks, tx hash).
+
+Pre-flight
+
+1. Clean tree at the release commit; `make test` green.
+2. `make test-fork` at the pinned block over an archive RPC, then `make test-smoke`. Record the
+   effective blocks, the RPC provider, and the commit.
+3. Set the `ETH_RPC_URL` repository secret, dispatch CI with `release_checks=true`, and record
+   the run URL.
+4. `make deploy-dry SENDER=<deployer>` with no `WARN` lines. Record the predicted address,
+   nonce, and gas estimate; without `SENDER` the address is forge's default sender's.
+5. Deployer keystore funded with headroom for about 5.5M gas at the intended gas price.
+6. Live wstGBP parameters still match the instance table (`bpsin`, `bpsout`, cooldown, windows).
+7. Re-read the upstream authorities table and record who accepted it and when.
+
+Broadcast
+
+8. `make deploy`. Record the tx hash, block, and vault address.
+
+Post-flight
+
+9. `make check VAULT=0x...` green.
+10. The explorer reports an exact match (inline verify, or `make verify VAULT=0x...`). This is
+    the bytecode authentication; the getter battery alone does not prove it.
+11. Commit `broadcast/DeployWstGbpVault.s.sol/1/run-latest.json`, fill the Vault column in the
+    instance table, and tag the release.
+12. Stand up monitoring: `deficit()`, NAV pause and update age, fee/window/cooldown changes,
+    wsgem gem liquidity against net liabilities, tGBP pause and bans, and upstream
+    implementation or authority changes. Run a keeper that calls `sync()` with each NAV poke.
+
 ### Dependencies (pinned submodules)
 
 | Lib | Rev |
 |---|---|
 | `forge-std` | `v1.16.2` |
-| `openzeppelin-contracts` | `v4.9.3` (also vendors the a16z `erc4626-tests` property suite used in `test/`) |
+| `openzeppelin-contracts` | `v4.9.3` (also vendors the a16z `erc4626-tests` property suite used in `test/`). Kept at the audited 4.9.3: across the vault's direct and transitive imports, the diff to v4.9.6 adds only an unused `_contextSuffixLength()` hook to `Context` (inherited through `ERC20`) and documentation changes |
 | `maseer-one` (wsgem framework source, **test-only**, BUSL-1.1) | `07eb992` |
 
 ## License

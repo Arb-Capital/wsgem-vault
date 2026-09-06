@@ -61,8 +61,7 @@ contract DeployWsgemVault is Script {
         public
         returns (WsgemVault vault)
     {
-        require(bytes(name).length != 0, "VAULT_NAME required");
-        require(bytes(symbol).length != 0, "VAULT_SYMBOL required");
+        _validateNaming(name, symbol);
         _validateTarget(wsgem, expectedGem);
 
         // Pre-deploy sanity: oracle alive.
@@ -96,7 +95,15 @@ contract DeployWsgemVault is Script {
         _sanity(WsgemVault(vaultAddr), wsgem, holder);
     }
 
+    /// @dev Share metadata is permanent on an immutable contract, so it is validated before
+    /// anything else; pinned subclasses refuse anything but their own.
+    function _validateNaming(string memory name, string memory symbol) internal view virtual {
+        require(bytes(name).length != 0, "VAULT_NAME required");
+        require(bytes(symbol).length != 0, "VAULT_SYMBOL required");
+    }
+
     function _validateTarget(address wsgem, address expectedGem) internal view virtual {
+        require(wsgem != address(0), "WSGEM required");
         require(expectedGem != address(0), "EXPECTED_GEM required");
         require(IWsgem(wsgem).gem() == expectedGem, "wsgem.gem() != EXPECTED_GEM");
     }
@@ -115,6 +122,9 @@ contract DeployWsgemVault is Script {
         require(vault.decimals() == 18, "vault decimals");
         require(vault.asset() == gem, "vault asset");
         require(vault.gem() == gem, "vault gem");
+        if (!vault.gemPausable()) {
+            console.log("WARN: gem exposed no paused() getter at construction; confirm the gem is non-pausable");
+        }
         // Operational checks are distinct from the price quotes.
         require(w.canPass(address(vault)), "vault fails compliance screen");
         require(vault.gemTransfersAvailable(), "gem transfers unavailable");

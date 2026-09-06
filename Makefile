@@ -103,8 +103,9 @@ serve-report :; python3 -m http.server 8000 --directory docs/coverage-report
 # Exercises config resolution, the pre-deploy asserts, and the whole post-deploy sanity
 # battery, and writes the planned tx to broadcast/<script>/1/dry-run/. Drives the pinned
 # wstGBP script; see SCRIPT above for any other instance. Falls back to the public RPC when
-# ETH_RPC_URL is unset.
-deploy-dry :; @$(KEYLESS) forge script $(SCRIPT) --rpc-url $(or $(ETH_RPC_URL),$(PUBLIC_RPC)) -vvv
+# ETH_RPC_URL is unset. Pass SENDER=0x... (the deployer address; no key needed to simulate
+# from it) so the predicted address and nonce are the real ones rather than forge's default.
+deploy-dry :; @$(KEYLESS) forge script $(SCRIPT) --rpc-url $(or $(ETH_RPC_URL),$(PUBLIC_RPC)) $(if $(SENDER),--sender $(SENDER)) -vvv
 
 # Mainnet deploy: deploys the vault, runs the sanity battery, and verifies on Etherscan
 # inline. Signs from an encrypted keystore (`--keystore` + `--sender`) — forge prompts for
@@ -124,14 +125,20 @@ deploy :
 		--broadcast --slow --verify --etherscan-api-key $(ETHERSCAN_API_KEY)
 
 # Verify an explicit mined address, with constructor arguments extracted from its on-chain
-# creation code. No signing wallet or transaction-submitting script is involved.
+# creation code. No signing wallet or transaction-submitting script is involved. For the
+# mainnet default the RPC's chain id is checked first: the constructor arguments are read
+# from the RPC but submitted to the CHAIN explorer, so a testnet ETH_RPC_URL left in .env
+# would otherwise feed the wrong chain's creation code to the mainnet explorer.
 # Usage: make verify VAULT=0x... (CHAIN defaults to mainnet for the pinned instance).
 CHAIN ?= mainnet
+VERIFY_RPC := $(or $(ETH_RPC_URL),$(PUBLIC_RPC))
 verify :
 	@test -n "$(VAULT)" || { echo "VAULT (deployed address) is required"; exit 1; }
 	@test -n "$(ETHERSCAN_API_KEY)" || { echo "ETHERSCAN_API_KEY is required"; exit 1; }
+	@[ "$(CHAIN)" != mainnet ] || [ "$$(cast chain-id --rpc-url "$(VERIFY_RPC)")" = 1 ] \
+		|| { echo "RPC is not Ethereum mainnet (chain id 1); refusing to read constructor args from it"; exit 1; }
 	@$(KEYLESS) forge verify-contract "$(VAULT)" src/WsgemVault.sol:WsgemVault \
-		--chain "$(CHAIN)" --rpc-url "$(or $(ETH_RPC_URL),$(PUBLIC_RPC))" \
+		--chain "$(CHAIN)" --rpc-url "$(VERIFY_RPC)" \
 		--guess-constructor-args --watch
 
 # Post-broadcast / any-time health check against a live vault (view-only, keyless): the full
