@@ -8,7 +8,7 @@ import {MaseerPrice} from "maseer-one/MaseerPrice.sol";
 import {MaseerGate} from "maseer-one/MaseerGate.sol";
 import {WsgemVault} from "../src/WsgemVault.sol";
 import {MockGem} from "./mocks/MockGem.sol";
-import {VaultTestBase} from "./VaultTestBase.sol";
+import {InvariantBase} from "./InvariantBase.sol";
 
 /// @dev Two campaigns for the two solvency questions WsgemVault.invariant.t.sol does not
 /// ask: can any sequence of vault legs extract value through rounding, and can any user
@@ -16,7 +16,7 @@ import {VaultTestBase} from "./VaultTestBase.sol";
 /// file: `fail_on_revert = false`, so every handler op keeps a liveness counter, violations
 /// are counted inside the handler rather than asserted, and a deterministic
 /// `test_HandlerWiring_*` proves every op reachable. Each campaign also runs over a
-/// 6-decimal gem.
+/// 6-decimal gem and checks the view facts shared by every campaign (InvariantBase).
 ///
 /// Seeds decode roles from their low 64 bits (payer/owner `% 3`, receiver `/ 3 % 3`,
 /// operator `/ 9 % 3`, via-operator `/ 27 % 2`); the rounding campaign reads an
@@ -114,8 +114,8 @@ abstract contract ActorHandler is Test {
 
 /// @notice Healthy market with a live oracle, fees anywhere from zero to 3% each way (so
 /// mintcost and burncost usually differ from navprice and from each other, and sometimes
-/// coincide), and a NAV that only accrues upward over time with the yield arriving in the
-/// wsgem's pool as gem. Every gem minted to an actor is credited to its `basis`; every leg
+/// coincide), and a NAV that accrues upward over time with the yield arriving in the
+/// wsgem's pool as gem, or marks down with nothing moving. Every gem minted to an actor is credited to its `basis`; every leg
 /// moves basis between payer/owner and receiver at the INPUT value, so what a conversion
 /// costs its receiver shows up as basis exceeding value. `modelLoss` accrues that cost as an
 /// independent reference model computes it from the wsgem's own mintcost/burncost/navprice
@@ -136,12 +136,16 @@ contract RoundingLedgerHandler is ActorHandler {
     uint256 public ghostMintExcess;
     uint256 public ghostGemDust;
     uint256 public ghostDonated;
+    uint256 public ghostGemDonated;
+    uint256 internal navFloor; // markdowns never take the NAV below half its initial value
 
     // Violation counters.
     uint256 public legReverted; // a leg bounded to succeed reverted
     uint256 public modelMismatch; // a leg returned something other than the reference model
     uint256 public residueExceeded;
+    uint256 public surplusExceeded;
     uint256 public sharesMovedOnAccrue;
+    uint256 public bystanderMoved; // a lap moved another actor's position or quotes
 
     // Op liveness counters.
     uint256 public depositOk;
@@ -155,6 +159,8 @@ contract RoundingLedgerHandler is ActorHandler {
     uint256 public accrueOk;
     uint256 public setFeesOk;
     uint256 public roundTripOk;
+    uint256 public markdownOk;
+    uint256 public donateGemOk;
 
     constructor(WsgemVault _vault, Wsgem _wsgem, MockGem _gem, MaseerPrice _pip, MaseerGate _act)
         ActorHandler(_vault, _wsgem, _gem, "r")
@@ -162,6 +168,7 @@ contract RoundingLedgerHandler is ActorHandler {
         pip = _pip;
         act = _act;
         ghostNav = wsgem.navprice();
+        navFloor = ghostNav / 2;
     }
 
     /*//////////////////////// ledger ////////////////////////////*/
@@ -195,6 +202,57 @@ contract RoundingLedgerHandler is ActorHandler {
         uint256 residue = needed * bc / WAD - assets; // the ceil on `needed` makes the claim cover `assets`
         ghostGemDust += residue;
         if (residue > _ceilDiv(bc, WAD) - 1) residueExceeded++;
+    }
+
+    /// @dev Books the wsgem a mint leaves beyond its shares per the model (`floor(assets /
+    /// mintcost) - shares`) against the README bound of less than one gem wei's worth of
+    /// wsgem, `ceil(1e18 / mintcost) - 1` per call.
+    function _surplus(uint256 assets, uint256 unit, uint256 shares) internal {
+        uint256 excess = assets * WAD / unit - shares;
+        ghostMintExcess += excess;
+        if (excess > _ceilDiv(WAD, unit) - 1) surplusExceeded++;
+    }
+
+    struct Bystander {
+        address who;
+        uint256 bal;
+        uint256 assets;
+        uint256 claim;
+        uint256 release;
+        uint256 maxW;
+    }
+
+    function _snapOthers(address a) internal view returns (Bystander[2] memory others) {
+        uint256 n;
+        for (uint256 i = 0; i < 3; i++) {
+            address b = actors[i];
+            if (b == a) continue;
+            uint256 bal = vault.balanceOf(b);
+            others[n++] = Bystander({
+                who: b,
+                bal: bal,
+                assets: vault.convertToAssets(bal),
+                claim: vault.previewRedeem(bal),
+                release: vault.previewRedeemToWsgem(bal),
+                maxW: vault.maxWithdraw(b)
+            });
+        }
+    }
+
+    /// @dev README: a lap leaves every other holder's balance, `convertToAssets`,
+    /// `previewRedeem` and `maxWithdraw` unchanged. A lap can only add gem to the wsgem's
+    /// pool (the exit claims at most what the entry paid), so a liquidity-capped
+    /// `maxWithdraw` may rise; an uncapped one (equal to the full claim) must not move.
+    function _checkOthers(Bystander[2] memory others) internal {
+        for (uint256 i = 0; i < 2; i++) {
+            Bystander memory o = others[i];
+            if (
+                vault.balanceOf(o.who) != o.bal || vault.convertToAssets(o.bal) != o.assets
+                    || vault.previewRedeem(o.bal) != o.claim || vault.previewRedeemToWsgem(o.bal) != o.release
+            ) bystanderMoved++;
+            uint256 maxW = vault.maxWithdraw(o.who);
+            if (o.maxW == o.claim ? maxW != o.maxW : maxW < o.maxW) bystanderMoved++;
+        }
     }
 
     /// @dev An amount in [lo, hi] shaped by the seed's mode: on a `unit` boundary, one
@@ -253,7 +311,7 @@ contract RoundingLedgerHandler is ActorHandler {
         if (assets != expected) modelMismatch++;
         // Model surplus independently; an observed backing shortfall belongs in the
         // holdings invariant, never in a subtraction that can revert this handler.
-        ghostMintExcess += expected * WAD / unit - shares;
+        _surplus(expected, unit, shares);
         _move(a, r, expected * WAD);
         ghostShares[r] += shares;
         modelLoss[r] += expected * WAD - shares * ghostNav;
@@ -403,6 +461,40 @@ contract RoundingLedgerHandler is ActorHandler {
         accrueOk++;
     }
 
+    /// @dev NAV marks down (the oracle is permissioned and non-monotonic), never below half
+    /// its initial value: every actor's entitlement is re-based by its wsgem-denominated
+    /// holdings, exactly, nothing moves in the pool, and no balance may move.
+    function markdown(uint256 raw) external {
+        uint256 nav = ghostNav;
+        if (nav <= navFloor) return;
+        uint256 next = bound(raw, navFloor, nav - 1);
+        uint256 supply = vault.totalSupply();
+        uint256 held = wsgem.balanceOf(address(vault));
+        uint256[3] memory bal;
+        for (uint256 i = 0; i < 3; i++) {
+            address a = actors[i];
+            bal[i] = vault.balanceOf(a);
+            uint256 tokens = wsgem.balanceOf(a) + bal[i];
+            basis[a] = basis[a] + SafeCast.toInt256(tokens * next) - SafeCast.toInt256(tokens * nav);
+        }
+        pip.poke(next);
+        ghostNav = next;
+        for (uint256 i = 0; i < 3; i++) {
+            if (vault.balanceOf(actors[i]) != bal[i]) sharesMovedOnAccrue++;
+        }
+        if (vault.totalSupply() != supply || wsgem.balanceOf(address(vault)) != held) sharesMovedOnAccrue++;
+        markdownOk++;
+    }
+
+    /// @dev Gem given to the vault by nobody in the ledger: no entitlement moves, so an
+    /// actor recovering any of it would breach the ledger.
+    function donateGem(uint256 raw) external {
+        uint256 amt = bound(raw, 1, _gemMax());
+        gem.mint(address(vault), amt);
+        ghostGemDonated += amt;
+        donateGemOk++;
+    }
+
     /// @dev Entry and exit fees anywhere in [0, 3%], independently, so the costs usually
     /// differ from nav and from each other and sometimes coincide.
     function setFees(uint256 rawIn, uint256 rawOut) external {
@@ -415,10 +507,12 @@ contract RoundingLedgerHandler is ActorHandler {
 
     /// @dev In and straight back out through each pairing of an entry and an exit leg, by
     /// one actor in one call: the shape a rounding exploit takes. Liquidity is guaranteed
-    /// because the exit claims at most the gem the entry just paid into the pool.
+    /// because the exit claims at most the gem the entry just paid into the pool. The two
+    /// other actors are snapshotted around the lap and must come out where they went in.
     function roundTrip(uint256 seed, uint256 which, uint256 raw) external {
         address a = _payer(seed);
         uint256 mc = wsgem.mintcost();
+        Bystander[2] memory others = _snapOthers(a);
         bool ok;
         which = which % 4;
         if (which == 0) ok = _rtDepositThenRedeem(a, _pick(seed, raw, mc, mc, _gemMax()), false);
@@ -429,6 +523,7 @@ contract RoundingLedgerHandler is ActorHandler {
             legReverted++;
             return;
         }
+        _checkOthers(others);
         roundTripOk++;
     }
 
@@ -469,7 +564,7 @@ contract RoundingLedgerHandler is ActorHandler {
         (ok, got) = _call(a, abi.encodeCall(vault.mint, (shares, a)));
         if (!ok) return false;
         if (got != expected) modelMismatch++;
-        ghostMintExcess += expected * WAD / unit - shares;
+        _surplus(expected, unit, shares);
         modelLoss[a] += expected * WAD - shares * ghostNav;
         ghostShares[a] += shares;
         return _rtWithdrawClaim(a, shares);
@@ -504,7 +599,7 @@ contract RoundingLedgerHandler is ActorHandler {
     }
 }
 
-contract WsgemVaultRoundingInvariantTest is VaultTestBase {
+contract WsgemVaultRoundingInvariantTest is InvariantBase {
     RoundingLedgerHandler internal handler;
 
     function setUp() public virtual override {
@@ -529,7 +624,8 @@ contract WsgemVaultRoundingInvariantTest is VaultTestBase {
         assertEq(wsgem.navprice(), nav, "ghost nav != oracle");
         assertEq(handler.legReverted(), 0, "a leg bounded to succeed reverted");
         assertEq(handler.modelMismatch(), 0, "a leg returned something other than the reference model");
-        assertEq(handler.sharesMovedOnAccrue(), 0, "NAV accrual moved a share balance or holding");
+        assertEq(handler.sharesMovedOnAccrue(), 0, "NAV move moved a share balance or holding");
+        assertEq(handler.bystanderMoved(), 0, "a lap moved a bystander's position or quotes");
         assertEq(vault.convertToAssets(WAD), nav, "share price != nav");
         assertEq(vault.previewMint(WAD), wsgem.mintcost(), "gem entry quote != wsgem mintcost");
         assertEq(vault.previewRedeem(WAD), wsgem.burncost(), "gem exit quote != wsgem burncost");
@@ -560,8 +656,17 @@ contract WsgemVaultRoundingInvariantTest is VaultTestBase {
             vault.totalSupply() + handler.ghostMintExcess() + handler.ghostDonated(),
             "held wsgem != shares + mint excess + donations"
         );
-        assertEq(gem.balanceOf(address(vault)), handler.ghostGemDust(), "vault gem != withdraw residue");
+        assertEq(
+            gem.balanceOf(address(vault)),
+            handler.ghostGemDust() + handler.ghostGemDonated(),
+            "vault gem != withdraw residue + gem gifts"
+        );
         assertEq(handler.residueExceeded(), 0, "withdraw residue above bound");
+        assertEq(handler.surplusExceeded(), 0, "mint surplus above bound");
+    }
+
+    function invariant_Spec() public view {
+        _checkSpec([handler.actor(0), handler.actor(1), handler.actor(2)], true);
     }
 
     function test_HandlerMint_MissingBackingStaysVisible() public {
@@ -669,6 +774,20 @@ contract WsgemVaultRoundingInvariantTest is VaultTestBase {
         handler.withdraw(roles(1, 1, 0, false, 5), 2 * one);
         handler.accrue(50);
 
+        // NAV marks down: balances pinned, value down, the ledger still exact; then a gem
+        // gift to the vault that no actor may recover.
+        nav0 = handler.ghostNav();
+        bal1 = vault.balanceOf(r1);
+        worth1 = vault.convertToAssets(bal1);
+        handler.markdown(0);
+        assertLt(handler.ghostNav(), nav0, "nav did not mark down");
+        assertEq(vault.balanceOf(r1), bal1, "markdown moved a share balance");
+        assertLt(vault.convertToAssets(bal1), worth1, "markdown did not cut the value");
+        invariant_RoundingLedger();
+        handler.donateGem(3 * one);
+        assertEq(handler.ghostGemDonated(), 3 * one, "gem gift");
+        invariant_VaultHoldingsAccounted();
+
         // Inflation-attack shape: r0 donates, r1 deposits, r0 exits in full and holds no
         // more than it paid for (the ledger runs mid-test to pin the payoff moment).
         handler.donateWsgem(roles(0, 0, 0, false, 5), 1e18);
@@ -696,12 +815,17 @@ contract WsgemVaultRoundingInvariantTest is VaultTestBase {
         assertGt(handler.transferOk(), 0, "transferShares");
         assertGt(handler.donateOk(), 0, "donateWsgem");
         assertEq(handler.accrueOk(), 2, "accrue");
+        assertEq(handler.markdownOk(), 1, "markdown");
+        assertEq(handler.donateGemOk(), 1, "donateGem");
         assertEq(handler.setFeesOk(), 3, "setFees");
         assertEq(handler.roundTripOk(), 4, "roundTrip");
         assertGt(handler.operatorOk(), 1, "operator flows");
+        assertEq(handler.bystanderMoved(), 0, "bystanders");
+        assertEq(handler.surplusExceeded(), 0, "surplus");
 
         invariant_RoundingLedger();
         invariant_VaultHoldingsAccounted();
+        invariant_Spec();
     }
 }
 
@@ -735,6 +859,7 @@ contract BackingDrainHandler is ActorHandler {
     uint256 public floorEff = 1; // backing ratio right after the last smelt, as eff / supply
     uint256 public floorSupply = 1;
     uint256 public lastRelease; // wsgem released by the last served redemption
+    uint256 internal navFloor; // markdowns never take the NAV below half its initial value
 
     // Violation counters (must all stay 0).
     uint256 public backingRatioDropped;
@@ -766,9 +891,12 @@ contract BackingDrainHandler is ActorHandler {
     uint256 public clearCooldownOps;
     uint256 public pauseMarketOps;
     uint256 public reopenMarketOps;
+    uint256 public setMintWindowOps;
+    uint256 public setBurnWindowOps;
     uint256 public pauseOracleOps;
     uint256 public unpauseOracleOps;
     uint256 public accrueOps;
+    uint256 public markdownOps;
     uint256 public setBpsinOps;
     uint256 public setBpsoutOps;
     uint256 public setCapacityOps;
@@ -798,6 +926,7 @@ contract BackingDrainHandler is ActorHandler {
         act = _act;
         issuer = _issuer;
         ghostNav = wsgem.navprice();
+        navFloor = ghostNav / 2;
     }
 
     /*//////////////////////// scoring ///////////////////////////*/
@@ -1028,11 +1157,12 @@ contract BackingDrainHandler is ActorHandler {
     /// actor could otherwise ask, and `x(max*())` must then succeed (a harmless no-op at
     /// 0). Probed in that order so the tightness check sees the state the max was quoted
     /// on. For the gem exits, `thin` usually drains the wsgem's pool to a few gem first so
-    /// the liquidity-capped branch of the max* arithmetic is the one probed. Skipped for a
-    /// banned actor: `max*` model the vault's compliance, not the caller's.
+    /// the liquidity-capped branch of the max* arithmetic is the one probed; for the wsgem
+    /// deposit (0 or unlimited, no `+1`) it sizes the deposit. Skipped for a banned actor:
+    /// `max*` model the vault's compliance, not the caller's.
     function probeMaxBoundary(uint256 seed, uint256 which, uint256 thin) external guarded {
         address a = _payer(seed);
-        which = which % 5;
+        which = which % 6;
         bool ok;
         if (gem.isBanned(a)) {
             probesSkipped++;
@@ -1089,13 +1219,25 @@ contract BackingDrainHandler is ActorHandler {
             }
             (ok,) = _call(a, abi.encodeCall(vault.redeem, (m, a, a)));
             if (!ok) maxReverted++;
-        } else {
+        } else if (which == 4) {
             uint256 m = vault.maxRedeemToWsgem(a);
             if (m < vault.balanceOf(a)) {
                 (ok,) = _call(a, abi.encodeCall(vault.redeemToWsgem, (m + 1, a, a)));
                 if (ok) maxNotTight++;
             }
             (ok,) = _call(a, abi.encodeCall(vault.redeemToWsgem, (m, a, a)));
+            if (!ok) maxReverted++;
+        } else {
+            // 0 or unlimited: a zero deposit must be a harmless no-op, and a bounded
+            // deposit must go through when the wsgem's own mint can fund it.
+            uint256 m = vault.maxDepositWsgem(a);
+            uint256 amt;
+            if (m == type(uint256).max) {
+                uint256 unit = wsgem.mintcost();
+                if (unit != 0) amt = _tryMintWsgemTo(a, bound(thin, unit, _gemMax()));
+                if (amt != 0) _approveWsgem(a);
+            }
+            (ok,) = _call(a, abi.encodeCall(vault.depositWsgem, (amt, a)));
             if (!ok) maxReverted++;
         }
         probesRun++;
@@ -1174,6 +1316,18 @@ contract BackingDrainHandler is ActorHandler {
         reopenMarketOps++;
     }
 
+    /// @dev The mint and burn windows are independent gates (the open timestamps are
+    /// never in the future, so the halt alone decides).
+    function setMintWindow(bool open) external guarded {
+        act.file("haltmint", open ? type(uint256).max : 0);
+        setMintWindowOps++;
+    }
+
+    function setBurnWindow(bool open) external guarded {
+        act.file("haltburn", open ? type(uint256).max : 0);
+        setBurnWindowOps++;
+    }
+
     function pauseOracle() external guarded {
         pip.pause();
         pauseOracleOps++;
@@ -1202,6 +1356,27 @@ contract BackingDrainHandler is ActorHandler {
         }
         if (vault.totalSupply() != supply) sharesMovedOnAccrue++;
         accrueOps++;
+    }
+
+    /// @dev NAV marks down (never below half its initial value) with nothing moving in the
+    /// pool; share balances and the supply must not move. Also brings a paused oracle back
+    /// live.
+    function markdown(uint256 raw) external guarded {
+        uint256 nav = ghostNav;
+        if (nav <= navFloor) {
+            markdownOps++;
+            return;
+        }
+        uint256 next = bound(raw, navFloor, nav - 1);
+        uint256 supply = vault.totalSupply();
+        uint256[3] memory bal = [vault.balanceOf(actors[0]), vault.balanceOf(actors[1]), vault.balanceOf(actors[2])];
+        pip.poke(next);
+        ghostNav = next;
+        for (uint256 i = 0; i < 3; i++) {
+            if (vault.balanceOf(actors[i]) != bal[i]) sharesMovedOnAccrue++;
+        }
+        if (vault.totalSupply() != supply) sharesMovedOnAccrue++;
+        markdownOps++;
     }
 
     function setBpsin(uint256 raw) external guarded {
@@ -1267,7 +1442,7 @@ contract BackingDrainHandler is ActorHandler {
     }
 }
 
-contract WsgemVaultDrainInvariantTest is VaultTestBase {
+contract WsgemVaultDrainInvariantTest is InvariantBase {
     BackingDrainHandler internal handler;
 
     function setUp() public virtual override {
@@ -1327,7 +1502,15 @@ contract WsgemVaultDrainInvariantTest is VaultTestBase {
         assertEq(handler.depositAcceptedInDeficit(), 0, "deposit accepted in deficit");
         assertEq(handler.maxReverted(), 0, "x(max*()) reverted");
         assertEq(handler.maxNotTight(), 0, "x(max*() + 1) succeeded");
-        assertEq(handler.sharesMovedOnAccrue(), 0, "NAV accrual moved a share balance");
+        assertEq(handler.sharesMovedOnAccrue(), 0, "NAV move moved a share balance");
+    }
+
+    function invariant_NoDanglingClaims() public view {
+        assertEq(wsgem.totalPending(), 0, "queued wsgem redemption claim");
+    }
+
+    function invariant_Spec() public view {
+        _checkSpec([handler.actor(0), handler.actor(1), handler.actor(2)], true);
     }
 
     /// @dev Anti-vacuity: a deterministic walk through every adversarial state, checking
@@ -1473,6 +1656,19 @@ contract WsgemVaultDrainInvariantTest is VaultTestBase {
         assertEq(handler.probesRun(), run + 2, "self-thinning probes");
         handler.refillLiquidity(1e6 * one);
 
+        // maxDepositWsgem: 0 in a deficit (the zero deposit is a no-op), unlimited otherwise.
+        handler.smelt(1e18);
+        assertEq(vault.maxDepositWsgem(a0), 0, "maxDepositWsgem in deficit");
+        uint256 supply = vault.totalSupply();
+        run = handler.probesRun();
+        handler.probeMaxBoundary(roles(0, 0, 0, false, 0), 5, 0);
+        assertEq(vault.totalSupply(), supply, "zero wsgem deposit minted shares");
+        handler.heal(type(uint256).max);
+        assertEq(vault.deficit(), 0, "second deficit not healed");
+        handler.probeMaxBoundary(roles(0, 0, 0, false, 0), 5, 7 * one);
+        assertGt(vault.totalSupply(), supply, "unlimited wsgem deposit not served");
+        assertEq(handler.probesRun(), run + 2, "wsgem deposit probes");
+
         // Fees, an accrual with balances pinned, a donation, and a served withdraw.
         handler.setBpsin(10);
         handler.setBpsout(30);
@@ -1485,6 +1681,27 @@ contract WsgemVaultDrainInvariantTest is VaultTestBase {
         served = handler.redeemsServed();
         handler.withdraw(roles(1, 0, 0, false, 0), 3 * one); // above the one-wsgem exit floor at the poked nav
         assertEq(handler.redeemsServed(), served + 1, "withdraw not served");
+
+        // NAV marks down with balances pinned; one-sided windows close only their own leg.
+        nav0 = wsgem.navprice();
+        bal1 = vault.balanceOf(a1);
+        handler.markdown(0);
+        assertLt(wsgem.navprice(), nav0, "nav did not mark down");
+        assertEq(vault.balanceOf(a1), bal1, "markdown moved a share balance");
+        handler.setMintWindow(false);
+        assertEq(vault.maxDeposit(a0), 0, "maxDeposit with mint closed");
+        assertGt(vault.maxRedeem(a0), 0, "maxRedeem with only mint closed");
+        blocked = handler.depositsBlocked();
+        handler.deposit(roles(0, 0, 0, false, 0), 2 * one);
+        assertEq(handler.depositsBlocked(), blocked + 1, "deposit not blocked with mint closed");
+        handler.setMintWindow(true);
+        handler.setBurnWindow(false);
+        assertEq(vault.maxRedeem(a0), 0, "maxRedeem with burn closed");
+        assertGt(vault.maxDeposit(a0), 0, "maxDeposit with only burn closed");
+        blocked = handler.redeemsBlocked();
+        handler.redeem(roles(0, 0, 0, false, 0), 1e18);
+        assertEq(handler.redeemsBlocked(), blocked + 1, "redeem not blocked with burn closed");
+        handler.setBurnWindow(true);
 
         // Every op ran.
         assertGt(handler.depositOps(), 0, "deposit");
@@ -1507,6 +1724,9 @@ contract WsgemVaultDrainInvariantTest is VaultTestBase {
         assertGt(handler.pauseOracleOps(), 0, "pauseOracle");
         assertGt(handler.unpauseOracleOps(), 0, "unpauseOracle");
         assertGt(handler.accrueOps(), 0, "accrue");
+        assertGt(handler.markdownOps(), 0, "markdown");
+        assertGt(handler.setMintWindowOps(), 0, "setMintWindow");
+        assertGt(handler.setBurnWindowOps(), 0, "setBurnWindow");
         assertGt(handler.setBpsinOps(), 0, "setBpsin");
         assertGt(handler.setBpsoutOps(), 0, "setBpsout");
         assertGt(handler.setCapacityOps(), 0, "setCapacity");
@@ -1520,11 +1740,13 @@ contract WsgemVaultDrainInvariantTest is VaultTestBase {
         assertGt(handler.gemBanActorOps(), 0, "gemBanActor");
         assertGt(handler.gemUnbanActorOps(), 0, "gemUnbanActor");
         assertGt(handler.probeOps(), 0, "probeMaxBoundary");
-        assertGt(handler.probesRun(), 6, "probes run");
+        assertGt(handler.probesRun(), 8, "probes run");
 
         // And nothing was ever violated.
         invariant_NoViolations();
         invariant_BackingFairness();
+        invariant_NoDanglingClaims();
+        invariant_Spec();
     }
 }
 
